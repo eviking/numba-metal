@@ -20,7 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import (
     BenchmarkResult,
     assert_allclose,
+    infer_launch_arg_types,
+    measure_cold_end_to_end,
+    measure_cold_metal_pipeline,
     require_metal_or_skip,
+    run_single_threaded,
     time_repeated,
 )
 
@@ -45,12 +49,17 @@ def numpy_impl(grid: np.ndarray, iterations: int) -> np.ndarray:
     return cur
 
 
-def _make_numba_cpu_impl():
-    from numba import njit
+def _make_numba_cpu_impl(*, parallel: bool):
+    from numba import njit, prange
 
-    @njit(cache=True, fastmath=False)
+    # Each iteration of the outer x loop writes only row x of `nxt` and
+    # only reads `cur` (never `nxt`), so rows are fully independent
+    # within one step -- safe to parallelize over x with prange.
+    loop_range = prange if parallel else range
+
+    @njit(parallel=parallel, cache=True, fastmath=False)
     def step(cur, nxt, n):
-        for x in range(1, n - 1):
+        for x in loop_range(1, n - 1):
             for y in range(1, n - 1):
                 nxt[x * n + y] = 0.25 * (
                     cur[(x - 1) * n + y]
@@ -134,7 +143,6 @@ def run(
     sizes: list[int] = SIZES, iterations: int = ITERATIONS
 ) -> list[BenchmarkResult]:
     results = []
-    numba_cpu_impl = _make_numba_cpu_impl()
     metal_available = require_metal_or_skip()
 
     for size in sizes:
@@ -148,40 +156,89 @@ def run(
         )
         result.numpy_ns = t_numpy.median_ns
 
-        out_cpu = numba_cpu_impl(grid, iterations)  # warm up / compile
-        t_cpu = time_repeated(
-            lambda: numba_cpu_impl(grid, iterations), warmup=1, repeats=3
+        cpu_parallel = _make_numba_cpu_impl(parallel=True)
+        out_cpu = cpu_parallel(grid, iterations)  # warm up / compile
+        t_cpu_par = time_repeated(
+            lambda: cpu_parallel(grid, iterations), warmup=1, repeats=3
         )
-        result.numba_cpu_ns = t_cpu.median_ns
+        result.numba_cpu_parallel_ns = t_cpu_par.median_ns
+        import numba
+
+        result.numba_cpu_num_threads = numba.get_num_threads()
         cpu_ok, cpu_note = assert_allclose(out_cpu, expected, rtol=1e-3, atol=1e-3)
 
+        cpu_single = _make_numba_cpu_impl(parallel=False)
+        cpu_single(grid, iterations)  # warm up / compile
+        t_cpu_single = run_single_threaded(
+            lambda: time_repeated(
+                lambda: cpu_single(grid, iterations), warmup=1, repeats=3
+            )
+        )
+        result.numba_cpu_single_ns = t_cpu_single.median_ns
+
         if metal_available:
+            from numba_metal import metal
+
+            metal_kernel = _make_metal_kernel()
+            threads = 256
+            n = grid.shape[0]
+            blocks = (n * n + threads - 1) // threads
+
+            def cold_launch(kernel=None):
+                k = kernel or metal_kernel
+                d_cur = metal.to_device(grid.reshape(-1))
+                d_nxt = metal.device_array_like(grid.reshape(-1))
+                k[blocks, threads](d_cur, d_nxt, np.int32(n))
+                metal.synchronize()
+
+            cold = measure_cold_end_to_end(metal_kernel.py_func, cold_launch)
+            result.metal_cold_total_ns = cold["total_ns"]
+            result.compiled_before = cold["compiled_before"]
+            result.compiled_after = cold["compiled_after"]
+
+            d_cur_probe = metal.to_device(grid.reshape(-1))
+            arg_types = infer_launch_arg_types(d_cur_probe, d_cur_probe, np.int32(n))
+            phases = measure_cold_metal_pipeline(metal_kernel.py_func, arg_types)
+            result.metal_frontend_ns = phases["frontend_ns"]
+            result.metal_pipeline_compile_ns = phases["pipeline_compile_ns"]
+
+            # "Resident": keep both buffers GPU-resident for the whole
+            # simulation; only transfer the initial grid in and the final
+            # grid out. This is the kernel-only + minimal-transfer number.
             t_resident = time_repeated(
                 lambda: _metal_resident(grid, iterations), warmup=1, repeats=3
             )
-            result.metal_warm_ns = t_resident.median_ns
+            result.metal_resident_pipeline_ns = t_resident.median_ns
+            result.metal_kernel_only_warm_ns = t_resident.median_ns / iterations
+            result.metal_end_to_end_warm_ns = t_resident.median_ns
             gpu_resident = _metal_resident(grid, iterations)
             gpu_ok, gpu_note = assert_allclose(
                 gpu_resident, expected, rtol=1e-2, atol=1e-2
             )
 
-            # Only measure the copy-every-launch variant at a small
-            # iteration count for the smallest size -- it is O(iterations)
-            # host<->device round trips and is illustratively slow, not
-            # something worth waiting on at full scale.
-            copy_every_launch_ns = None
-            if size == sizes[0]:
-                small_iters = min(iterations, 50)
-                t_copy = time_repeated(
-                    lambda: _metal_copy_every_launch(grid, small_iters),
-                    warmup=0,
-                    repeats=1,
-                )
-                copy_every_launch_ns = t_copy.median_ns
+            # "Copy every launch": re-upload the current grid and download
+            # the result on every single iteration, at the SAME iteration
+            # count as the resident variant, so the two are a fair,
+            # apples-to-apples per-iteration comparison (not different
+            # iteration counts dressed up as comparable numbers). This is
+            # O(iterations) host<->device round trips and is deliberately
+            # the worst case.
+            t_copy = time_repeated(
+                lambda: _metal_copy_every_launch(grid, iterations),
+                warmup=0,
+                repeats=1,
+            )
+            copy_every_launch_ns = t_copy.median_ns
 
             result.correctness_ok = cpu_ok and gpu_ok
             result.correctness_note = f"cpu: {cpu_note}; gpu(resident): {gpu_note}"
-            result.extra["metal_copy_every_launch_ns"] = copy_every_launch_ns
+            result.extra["metal_copy_every_launch_total_ns"] = copy_every_launch_ns
+            result.extra["metal_copy_every_launch_per_iter_ns"] = (
+                copy_every_launch_ns / iterations
+            )
+            result.extra["metal_resident_per_iter_ns"] = (
+                result.metal_resident_pipeline_ns / iterations
+            )
             result.extra["iterations"] = iterations
         else:
             result.correctness_ok = cpu_ok
@@ -198,12 +255,12 @@ if __name__ == "__main__":
     print_table(results)
     print()
     for r in results:
-        copy_ns = r.extra.get("metal_copy_every_launch_ns")
-        if copy_ns is not None:
+        per_iter_copy = r.extra.get("metal_copy_every_launch_per_iter_ns")
+        per_iter_resident = r.extra.get("metal_resident_per_iter_ns")
+        if per_iter_copy is not None:
             print(
-                f"{r.benchmark} {r.size_label}: resident="
-                f"{format_ns(r.metal_warm_ns)} for {r.extra['iterations']} iters vs "
-                f"copy-every-launch={format_ns(copy_ns)} for "
-                f"{min(r.extra['iterations'], 50)} iters "
+                f"{r.benchmark} {r.size_label}, {r.extra['iterations']} iters "
+                f"(same count for both): resident={format_ns(per_iter_resident)}/iter "
+                f"vs copy-every-launch={format_ns(per_iter_copy)}/iter "
                 "(per-iteration transfer cost dominates when data is not resident)"
             )

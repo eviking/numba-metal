@@ -47,7 +47,7 @@ def test_mandelbrot_small() -> None:
     metal.synchronize()
     result = d_out.copy_to_host()
 
-    cpu_impl = mb._make_numba_cpu_impl()
+    cpu_impl = mb._make_numba_cpu_impl(parallel=True)
     out_cpu = np.empty(width * height, dtype=np.int32)
     cpu_impl(out_cpu, width, height, max_iter)
     assert np.array_equal(result, out_cpu)
@@ -90,7 +90,7 @@ def test_monte_carlo_paths_small() -> None:
     metal.synchronize()
     gpu_terminal = d_out.copy_to_host()
 
-    cpu_impl = mc._make_numba_cpu_impl()
+    cpu_impl = mc._make_numba_cpu_impl(parallel=True)
     out_cpu = np.empty(n_paths, dtype=np.float32)
     cpu_impl(z_flat, out_cpu, n_paths, n_steps, mc.S0, mc.K, mc.R, mc.SIGMA, mc.T)
 

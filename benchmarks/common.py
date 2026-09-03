@@ -91,6 +91,152 @@ def time_repeated(
     return Timing(samples)
 
 
+def infer_launch_arg_types(*launch_args) -> tuple:
+    """Derive the Numba argument-type tuple for a set of launch
+    arguments (device arrays / scalars), using numba-metal's own
+    dispatcher inference logic directly rather than re-deriving a
+    parallel dtype-mapping table here."""
+    from numba_metal.runtime.dispatcher import _infer_arg_type
+
+    return tuple(_infer_arg_type(a) for a in launch_args)
+
+
+def measure_cold_metal_pipeline(
+    py_func: Callable[..., Any], arg_types: tuple
+) -> dict[str, float | int]:
+    """Measure a guaranteed-cold Metal compilation for `py_func` at
+    `arg_types`, split into the three phases the assignment requires be
+    reported separately:
+
+    - frontend_ns: Numba typed-IR frontend + numba-metal's MSL lowering
+      (`compile_to_typed_ir` + `MSLKernelLowerer.lower()`), no device
+      interaction at all.
+    - pipeline_compile_ns: `MTLLibrary`/`MTLComputePipelineState`
+      creation from that generated MSL source, on-device.
+    - total_ns: the two phases combined, timed as a single wall-clock
+      span (not just frontend_ns + pipeline_compile_ns summed after the
+      fact) so it also captures any cache-lookup/bookkeeping overhead
+      between them.
+
+    Uses the pipeline module's own functions directly (not a
+    `@metal.jit` dispatcher's cache) so "cold" is unambiguous: nothing
+    about this call could hit a pre-existing cache entry, since no
+    KernelCache is involved at all.
+    """
+    from numba_metal.compiler.frontend import compile_to_typed_ir
+    from numba_metal.compiler.msl_backend import MSLKernelLowerer
+    from numba_metal.compiler.pipeline import _MSL_PRELUDE, _next_kernel_name
+    from numba_metal.runtime.context import get_context
+
+    t_total_start = time.perf_counter_ns()
+
+    t0 = time.perf_counter_ns()
+    typed = compile_to_typed_ir(py_func, arg_types)
+    kernel_name = _next_kernel_name(getattr(py_func, "__name__", "kernel"))
+    lowerer = MSLKernelLowerer(kernel_name, typed)
+    body_src = lowerer.lower()
+    full_src = _MSL_PRELUDE + body_src
+    t1 = time.perf_counter_ns()
+    frontend_ns = t1 - t0
+
+    import Metal
+
+    ctx = get_context()
+    device = ctx.device
+    opts = Metal.MTLCompileOptions.alloc().init()
+    opts.setFastMathEnabled_(False)
+
+    t2 = time.perf_counter_ns()
+    library, err = device.newLibraryWithSource_options_error_(full_src, opts, None)
+    if library is None:
+        raise RuntimeError(f"Metal shader compilation failed: {err}")
+    function = library.newFunctionWithName_(kernel_name)
+    pipeline_state, perr = device.newComputePipelineStateWithFunction_error_(
+        function, None
+    )
+    if pipeline_state is None:
+        raise RuntimeError(f"Metal pipeline creation failed: {perr}")
+    t3 = time.perf_counter_ns()
+    pipeline_compile_ns = t3 - t2
+
+    t_total_end = time.perf_counter_ns()
+
+    return {
+        "frontend_ns": float(frontend_ns),
+        "pipeline_compile_ns": float(pipeline_compile_ns),
+        "total_ns": float(t_total_end - t_total_start),
+    }
+
+
+def measure_cold_end_to_end(
+    py_func: Callable[..., Any], launch: Callable[[Any], None]
+) -> dict[str, float | int]:
+    """Measure a guaranteed-cold end-to-end Metal launch: builds a
+    brand-new `@metal.jit` dispatcher around `py_func` (own fresh
+    `KernelCache`, so this cannot hit a pre-existing cache entry -- see
+    `KernelDispatcher.__init__`, dispatcher.py), then calls
+    `launch(kernel)`, which must perform exactly one launch + explicit
+    `metal.synchronize()`.
+
+    Returns the wall-clock total plus `compiled_before`/`compiled_after`
+    cache-entry counts, which must show `compiled_after >
+    compiled_before` as evidence the measured call really did compile
+    (not reuse a warm cache) -- the "make every cold timing demonstrably
+    cold" requirement.
+    """
+    from numba_metal import metal
+
+    kernel = metal.jit(py_func)
+    compiled_before = len(kernel._cache)
+    t0 = time.perf_counter_ns()
+    launch(kernel)
+    t1 = time.perf_counter_ns()
+    compiled_after = len(kernel._cache)
+    return {
+        "total_ns": float(t1 - t0),
+        "compiled_before": compiled_before,
+        "compiled_after": compiled_after,
+    }
+
+
+def numba_cpu_thread_variants(
+    make_impl: Callable[[bool], Any],
+) -> dict[str, Any]:
+    """Build both a parallel (`@njit(parallel=True)`, default thread
+    count) and single-threaded (`set_num_threads(1)`, restored
+    afterward) variant of a Numba CPU implementation, returning the
+    thread count actually in effect for the parallel variant.
+
+    `make_impl(parallel: bool)` must return a freshly-decorated
+    `@njit(...)` callable each call (decorating the same dispatcher
+    twice with different `parallel=` is not meaningful -- each call
+    must build its own `njit(...)` wrapper around the plain function).
+    """
+    import numba
+
+    default_threads = numba.get_num_threads()
+    parallel_impl = make_impl(True)
+    single_impl = make_impl(False)
+    return {
+        "parallel_impl": parallel_impl,
+        "single_impl": single_impl,
+        "num_threads": default_threads,
+    }
+
+
+def run_single_threaded(fn: Callable[[], Any]) -> Any:
+    """Run `fn` with Numba's parallel thread count forced to 1, restoring
+    the previous count afterward regardless of outcome."""
+    import numba
+
+    previous = numba.get_num_threads()
+    numba.set_num_threads(1)
+    try:
+        return fn()
+    finally:
+        numba.set_num_threads(previous)
+
+
 def get_mac_hardware_info() -> dict[str, str]:
     info: dict[str, str] = {}
     try:
@@ -160,7 +306,42 @@ def get_environment_info() -> dict[str, Any]:
 
 @dataclass
 class BenchmarkResult:
-    """One (benchmark, size) result row."""
+    """One (benchmark, size) result row.
+
+    Timing categories are kept separate per-category rather than folded
+    into a single "GPU time," per the requirement that compilation,
+    transfer, and kernel-execution time must never be conflated:
+
+    - python_ns / numpy_ns: reference CPU implementations (informational).
+    - numba_cpu_parallel_ns / numba_cpu_single_ns: warm Numba CPU
+      (@njit) execution, parallel (prange, default thread count) and
+      single-threaded (set_num_threads(1)) respectively. Thread count
+      actually used is recorded in numba_cpu_num_threads.
+    - metal_frontend_ns: Numba typed-IR frontend + numba-metal's
+      lowering to MSL source text, measured on a guaranteed-cold
+      dispatcher (fresh KernelCache) with device/pipeline compilation
+      excluded.
+    - metal_pipeline_compile_ns: MTLLibrary/MTLComputePipelineState
+      compilation from the generated MSL, on that same cold dispatcher.
+    - metal_cold_total_ns: frontend + pipeline compile + first launch,
+      measured end-to-end on a fresh dispatcher (metal_frontend_ns and
+      metal_pipeline_compile_ns are subsets of this).
+    - metal_kernel_only_warm_ns: warm (already-compiled) kernel launch
+      + synchronize only, with input/output buffers already resident on
+      device -- excludes all host<->device transfer.
+    - metal_h2d_ns / metal_d2h_ns: host-to-device / device-to-host
+      transfer time, measured separately from kernel execution.
+    - metal_end_to_end_warm_ns: warm H2D + kernel + D2H, i.e. what a
+      caller experiences per call when data starts and ends on the host.
+    - metal_resident_pipeline_ns: warm kernel-only time for a workload
+      that keeps data GPU-resident across repeated launches (only
+      meaningful for benchmarks with an iterative/repeated-launch
+      structure; None otherwise).
+    - compiled_before / compiled_after: KernelCache entry counts before
+      and after the cold-timing section, proof that metal_cold_total_ns
+      really did include a fresh compilation (compiled_after >
+      compiled_before), not stale/reused cache state.
+    """
 
     benchmark: str
     size_label: str
@@ -168,18 +349,32 @@ class BenchmarkResult:
     correctness_note: str = ""
     python_ns: float | None = None
     numpy_ns: float | None = None
-    numba_cpu_ns: float | None = None
-    metal_warm_ns: float | None = None
-    metal_cold_ns: float | None = None
-    metal_compile_ns: float | None = None
+    numba_cpu_parallel_ns: float | None = None
+    numba_cpu_single_ns: float | None = None
+    numba_cpu_num_threads: int | None = None
+    metal_frontend_ns: float | None = None
+    metal_pipeline_compile_ns: float | None = None
+    metal_cold_total_ns: float | None = None
+    metal_kernel_only_warm_ns: float | None = None
     metal_h2d_ns: float | None = None
     metal_d2h_ns: float | None = None
+    metal_end_to_end_warm_ns: float | None = None
+    metal_resident_pipeline_ns: float | None = None
+    compiled_before: int | None = None
+    compiled_after: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def numba_cpu_ns(self) -> float | None:
+        """Primary Numba CPU evidence number (parallel if available, else
+        single-threaded), used for the headline speedup column."""
+        return self.numba_cpu_parallel_ns or self.numba_cpu_single_ns
+
     def speedup_vs(self, baseline_ns: float | None) -> str:
-        if baseline_ns is None or self.metal_warm_ns is None or self.metal_warm_ns <= 0:
+        warm = self.metal_kernel_only_warm_ns
+        if baseline_ns is None or warm is None or warm <= 0:
             return "N/A"
-        return f"{baseline_ns / self.metal_warm_ns:.2f}x"
+        return f"{baseline_ns / warm:.2f}x"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -189,17 +384,31 @@ class BenchmarkResult:
             "correctness_note": self.correctness_note,
             "python_ns": self.python_ns,
             "numpy_ns": self.numpy_ns,
-            "numba_cpu_ns": self.numba_cpu_ns,
-            "metal_warm_ns": self.metal_warm_ns,
-            "metal_cold_ns": self.metal_cold_ns,
-            "metal_compile_ns": self.metal_compile_ns,
+            "numba_cpu_parallel_ns": self.numba_cpu_parallel_ns,
+            "numba_cpu_single_ns": self.numba_cpu_single_ns,
+            "numba_cpu_num_threads": self.numba_cpu_num_threads,
+            "metal_frontend_ns": self.metal_frontend_ns,
+            "metal_pipeline_compile_ns": self.metal_pipeline_compile_ns,
+            "metal_cold_total_ns": self.metal_cold_total_ns,
+            "metal_kernel_only_warm_ns": self.metal_kernel_only_warm_ns,
             "metal_h2d_ns": self.metal_h2d_ns,
             "metal_d2h_ns": self.metal_d2h_ns,
+            "metal_end_to_end_warm_ns": self.metal_end_to_end_warm_ns,
+            "metal_resident_pipeline_ns": self.metal_resident_pipeline_ns,
+            "compiled_before": self.compiled_before,
+            "compiled_after": self.compiled_after,
             "speedup_vs_python": self.speedup_vs(self.python_ns),
             "speedup_vs_numpy": self.speedup_vs(self.numpy_ns),
-            "speedup_vs_numba_cpu": self.speedup_vs(self.numba_cpu_ns),
+            "speedup_vs_numba_cpu_parallel": self.speedup_vs(
+                self.numba_cpu_parallel_ns
+            ),
+            "speedup_vs_numba_cpu_single": self.speedup_vs(self.numba_cpu_single_ns),
             **self.extra,
         }
+
+
+def _fmt(ns: float | None) -> str:
+    return format_ns(ns) if ns is not None else "N/A"
 
 
 def print_table(results: list[BenchmarkResult]) -> None:
@@ -208,10 +417,11 @@ def print_table(results: list[BenchmarkResult]) -> None:
         "Size",
         "Python",
         "NumPy",
-        "Numba CPU",
-        "Metal warm",
-        "Metal total",
-        "vs Numba",
+        "Numba CPU(par)",
+        "Numba CPU(1t)",
+        "Metal kernel-warm",
+        "Metal cold total",
+        "vs Numba(par)",
         "Correct",
     ]
     rows = []
@@ -220,12 +430,13 @@ def print_table(results: list[BenchmarkResult]) -> None:
             [
                 r.benchmark,
                 r.size_label,
-                format_ns(r.python_ns) if r.python_ns is not None else "N/A",
-                format_ns(r.numpy_ns) if r.numpy_ns is not None else "N/A",
-                format_ns(r.numba_cpu_ns) if r.numba_cpu_ns is not None else "N/A",
-                format_ns(r.metal_warm_ns) if r.metal_warm_ns is not None else "N/A",
-                format_ns(r.metal_cold_ns) if r.metal_cold_ns is not None else "N/A",
-                r.speedup_vs(r.numba_cpu_ns),
+                _fmt(r.python_ns),
+                _fmt(r.numpy_ns),
+                _fmt(r.numba_cpu_parallel_ns),
+                _fmt(r.numba_cpu_single_ns),
+                _fmt(r.metal_kernel_only_warm_ns),
+                _fmt(r.metal_cold_total_ns),
+                r.speedup_vs(r.numba_cpu_parallel_ns),
                 "yes" if r.correctness_ok else "NO",
             ]
         )

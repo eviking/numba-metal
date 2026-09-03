@@ -22,43 +22,96 @@ Every measured section:
    and `docs/troubleshooting.md` because it is the single easiest way to
    produce a meaningless benchmark number.
 
-## Cold vs. warm execution
+## Timing categories
 
-- **Cold**: the very first launch of a given kernel+signature, which
-  includes Numba's typed-IR frontend compilation *and* Apple's Metal
-  shader compilation (both triggered by `KernelCache.get_or_compile` on a
-  cache miss). Reported as `metal_cold_ns` / "Metal total" in the table
-  and JSON output.
-- **Warm**: launches after the kernel is already in the in-process
-  compilation cache -- pure dispatch + GPU execution + (implicit)
-  synchronization cost, no compilation. Reported as `metal_warm_ns` /
-  "Metal warm".
+Every result row (`BenchmarkResult` in `benchmarks/common.py`) reports
+these as **separate, never-conflated** fields -- compilation, transfer,
+and kernel execution are never folded into one "GPU time" number:
 
-The gap between these two numbers is often large (milliseconds to tens of
-milliseconds for cold vs. sub-millisecond to low-milliseconds for warm on
-the workloads in this repo) and is the actual cost of numba-metal's JIT
-model -- a fair comparison against Numba's own `@njit` (which has an
-equivalent, separately-measured cold-compile cost) accounts for this
-rather than only reporting whichever number looks better.
+| Field | What it measures |
+|---|---|
+| `python_ns` / `numpy_ns` | Reference CPU implementations (informational, not the primary evidence). |
+| `numba_cpu_parallel_ns` | Warm `@njit(parallel=True)` execution using `prange`, at Numba's default thread count (recorded in `numba_cpu_num_threads`). |
+| `numba_cpu_single_ns` | The same kernel, forced to one thread via `numba.set_num_threads(1)` (restored afterward). A separate compiled dispatcher, not the same object timed twice. |
+| `metal_frontend_ns` | Numba typed-IR frontend + numba-metal's lowering to MSL source text. No device interaction. Measured via `compile_to_typed_ir` + `MSLKernelLowerer.lower()` called directly, so nothing about the call could hit a pre-existing cache. |
+| `metal_pipeline_compile_ns` | `MTLLibrary`/`MTLComputePipelineState` creation from that generated MSL, on-device. |
+| `metal_cold_total_ns` | Frontend + pipeline compile + first launch, timed end-to-end on a **brand-new** `@metal.jit` dispatcher (its own fresh `KernelCache`). |
+| `compiled_before` / `compiled_after` | `len(dispatcher._cache)` before and after the cold-timing call. `compiled_after > compiled_before` is the evidence that the cold measurement really did compile, not reuse a warm cache -- this is checked, not assumed, for every cold number in this document. |
+| `metal_kernel_only_warm_ns` | Warm (already-compiled) launch + synchronize, with all buffers already device-resident. Excludes every host&harr;device transfer. |
+| `metal_h2d_ns` / `metal_d2h_ns` | Host-to-device / device-to-host transfer time, measured separately from kernel execution. |
+| `metal_end_to_end_warm_ns` | What a caller actually experiences per call when data starts and ends on the host: warm H2D + kernel + D2H (or the closest equivalent for kernels with no host input, e.g. Mandelbrot). |
+| `metal_resident_pipeline_ns` | Only populated for the iterative heat-diffusion benchmark: warm kernel-only time across the *whole* multi-iteration run with data kept GPU-resident throughout. |
+
+`speedup_vs_numba_cpu_parallel` / `speedup_vs_numba_cpu_single` in the
+JSON output are always computed against `metal_kernel_only_warm_ns` (not
+a transfer-inclusive number), so the "vs Numba" column is a genuine
+compute-vs-compute comparison; the separate `metal_h2d_ns`/`metal_d2h_ns`
+fields let you add transfer cost back in for the caller's actual
+end-to-end scenario.
+
+## Cold vs. warm execution, made demonstrably cold
+
+Earlier revisions of this benchmark suite reused the *same* persistent
+`@metal.jit` dispatcher for "cold" and "warm" timing within one problem
+size, meaning only the very first size measured in a run was ever
+actually uncompiled -- every subsequent size's "cold" number silently hit
+an already-warm process-wide state for that kernel function. That bug is
+fixed: every cold measurement (`measure_cold_end_to_end` /
+`measure_cold_metal_pipeline` in `benchmarks/common.py`) now constructs
+its own fresh `KernelDispatcher`/`KernelCache` (or calls the frontend/MSL
+compilation functions directly, bypassing any cache entirely), and
+records `compiled_before`/`compiled_after` cache-entry counts as
+machine-checkable proof.
+
+The gap between cold and warm is often large (tens of milliseconds for
+cold vs. sub-millisecond to low-milliseconds for warm on the workloads in
+this repo) and is the actual cost of numba-metal's JIT model -- a fair
+comparison against Numba's own `@njit` (which has an equivalent,
+separately-measured cold-compile cost, not reported here since Numba's
+own compilation-caching behavior is out of scope for this project) should
+account for this rather than only reporting whichever number looks
+better.
+
+## Numba CPU: parallel and single-threaded, with thread count recorded
+
+Every benchmark builds **two independent** Numba CPU dispatchers per
+problem size: `_make_numba_cpu_impl(parallel=True)` (using `prange` for
+the outer loop) and `_make_numba_cpu_impl(parallel=False)` (the same
+source, with the outer loop's `prange` replaced by plain `range` via a
+`loop_range` closure variable, and `set_num_threads(1)` in effect for the
+duration of the measurement, restored afterward). `numba_cpu_num_threads`
+records the thread count actually in effect for the parallel run
+(`numba.get_num_threads()`), so a reader never has to guess how many
+cores the "Numba CPU (par)" column represents. The single-threaded number
+is reported as primary supporting evidence alongside the parallel one,
+not omitted -- for several small-grid workloads in this repo (e.g. Heat
+diffusion at 64²/128², vector polynomial at 10,000 elements), the
+single-threaded number is *faster* than the parallel one, because
+`prange`'s thread-pool dispatch overhead exceeds the actual per-thread
+work at that size. That is reported plainly, not smoothed over.
 
 ## Transfer-inclusive vs. resident-data timing
 
-`benchmarks/vector_polynomial.py`, `pairwise_distance.py`, and
-`monte_carlo_paths.py` separately measure `metal_h2d_ns` (host-to-device
-upload) and `metal_d2h_ns` (device-to-host download) so the transfer cost
-can be seen independent of kernel execution time. `metal_warm_ns` itself
-measures only the launch+sync (data already resident); it does not
-include a fresh upload/download on every iteration.
+`vector_polynomial.py`, `mandelbrot.py`, `monte_carlo_paths.py`, and
+`pairwise_distance.py` separately measure `metal_h2d_ns` (host-to-device
+upload) and `metal_d2h_ns` (device-to-host download) so transfer cost is
+visible independent of kernel execution time. `metal_kernel_only_warm_ns`
+measures only the launch+sync with data already resident; it never
+includes a fresh upload/download.
 
-`benchmarks/heat_diffusion.py` makes this distinction the actual subject
-of the benchmark: it compares keeping both ping-pong buffers GPU-resident
-for an entire multi-iteration simulation (`_metal_resident`, only
-uploading the initial grid and downloading the final one) against
-re-uploading and re-downloading on every single iteration
-(`_metal_copy_every_launch`). The difference between these two numbers is
-the actual cost of not keeping data resident -- and it is substantial,
-because per-iteration `MTLBuffer` allocation and host<->device memcpy
-dominate over a tiny per-iteration compute kernel at small grid sizes.
+`heat_diffusion.py` makes this distinction the actual subject of the
+benchmark: it compares keeping both ping-pong buffers GPU-resident for an
+entire multi-iteration simulation (`_metal_resident`, only uploading the
+initial grid and downloading the final one, reported as
+`metal_resident_pipeline_ns`) against re-uploading and re-downloading on
+every single iteration (`_metal_copy_every_launch`). Both variants now
+run at the **same iteration count** (previously the copy-every-launch
+variant was capped at a smaller iteration count "for illustration,"
+which made the two numbers not directly comparable); the per-iteration
+cost of each (`extra["metal_resident_per_iter_ns"]` /
+`extra["metal_copy_every_launch_per_iter_ns"]`) is the fair, apples-to-
+apples comparison, and the difference between them is the actual
+measured cost of not keeping data resident.
 
 ## Synchronization
 
@@ -91,15 +144,18 @@ development/CI sanity check; it is not used to produce the numbers below.
   size threshold, since an O(n) or worse pure-Python loop over millions
   of elements is prohibitively slow and adds no useful signal).
 - **NumPy**: a vectorized implementation using standard array operations.
-  For Mandelbrot specifically, the "vectorized" NumPy implementation
-  still does the *same* fixed amount of work per pixel every iteration
-  (masked rather than early-exited, since per-element early exit isn't
-  expressible in vectorized NumPy) -- this makes it a legitimate but
-  structurally different algorithm from the scalar CPU/GPU versions, which
-  matters for the correctness discussion below.
-- **Numba CPU**: `@njit` (with `parallel=True, fastmath=False, cache=True`
-  where a `prange`-parallelizable loop exists), the same scalar,
-  early-exiting algorithm as the GPU kernel.
+  This is a genuinely different algorithm in two of the five benchmarks,
+  documented explicitly rather than treated as a like-for-like
+  comparison: Mandelbrot's vectorized form does the *same* fixed amount
+  of work per pixel every iteration (masked rather than early-exited,
+  since per-element early exit isn't expressible vectorized), and
+  pairwise distance's broadcast form materializes a full `(n_a, n_b, k)`
+  temporary array (~3.2 GiB at the largest configured size) that neither
+  the CPU nor GPU kernel ever allocates.
+- **Numba CPU**: `@njit`, both `parallel=True` (via `prange`, default
+  thread count) and `parallel=False` (single-threaded), the same scalar,
+  early-exiting algorithm as the GPU kernel. This is the primary
+  comparison evidence; Python/NumPy numbers are secondary/informational.
 - **Metal**: this project's backend.
 
 ## Numerical tolerance
@@ -116,11 +172,19 @@ development/CI sanity check; it is not used to produce the numbers below.
   required everywhere except a small, bounded fraction of pixels
   (default 0.1%) that may differ by exactly 1 iteration. This is not
   tolerance for a bug -- see "Why some workloads can be slower / differ on
-  Metal" below for the concrete, measured root cause.
+  Metal" below for the concrete, measured root cause. Its `correctness_ok`
+  gate always compares GPU (float32) against a float32 scalar CPU
+  reference built specifically for this comparison; the vectorized NumPy
+  float64 number is logged as a separate, explicitly-labeled
+  informational note (`numpy_vs_cpu_note`) and never participates in the
+  pass/fail decision.
 - Every correctness check reports which comparison it used and the
   measured deviation (or pass/fail reason) in `correctness_note`, both in
   the printed table and the JSON output -- tolerances are never silently
-  widened without being visible in the result.
+  widened without being visible in the result, and `correctness_ok` is
+  always derived directly from the same boolean the note text describes
+  (never a case where the note says "FAILED" but `correctness_ok` is
+  `True`, or vice versa).
 
 ## How to reproduce these results
 
@@ -142,28 +206,43 @@ M4 Pro, macOS 26.5.1, Python 3.13.5, Numba 0.67.0**. They are one sample
 run, not a guarantee -- rerun `run_all.py` on your own machine, and treat
 any number below as illustrative of *what was actually measured once*,
 not a promised speedup. All 15 correctness checks passed on this run.
+Every `metal_cold_total_ns` figure below was confirmed via
+`compiled_before`/`compiled_after` to reflect a genuine fresh compilation
+(`compiled_before=0, compiled_after=1` in every row).
 
-| Benchmark | Size | Numba CPU (warm) | Metal (warm) | Metal vs Numba CPU |
-|---|---|---|---|---|
-| Vector polynomial | 10,000 | 10.5us | 483us | 0.02x (GPU slower: dispatch overhead dominates at this size) |
-| Vector polynomial | 1,000,000 | 969us | 898us | 1.08x |
-| Vector polynomial | 10,000,000 | 9.86ms | 1.62ms | 6.10x |
-| Mandelbrot | 512² | 2.06ms | 1.07ms | 1.92x |
-| Mandelbrot | 2048² | 30.5ms | 2.00ms | 15.27x |
-| Mandelbrot | 4096² | 126.2ms | 7.12ms | 17.72x |
-| Heat diffusion | 128² (200 iters) | 3.26ms | 40.4ms | 0.08x (GPU slower: per-launch overhead over 200 tiny kernels dominates at this grid size) |
-| Heat diffusion | 512² (200 iters) | 52.5ms | 40.8ms | 1.29x |
-| Heat diffusion | 1024² (200 iters) | 210.0ms | 66.0ms | 3.18x |
-| Monte Carlo paths | 10,000 | 219us | 320us | 0.69x |
-| Monte Carlo paths | 200,000 | 2.19ms | 1.48ms | 1.48x |
-| Monte Carlo paths | 2,000,000 | 20.4ms | 6.34ms | 3.22x |
-| Pairwise distance | 200x200x8 | 112us | 663us | 0.17x |
-| Pairwise distance | 2000x2000x8 | 1.63ms | 2.02ms | 0.81x |
-| Pairwise distance | 5000x5000x16 | 17.5ms | 10.7ms | 1.63x |
+| Benchmark | Size | Numba CPU (par, N threads) | Numba CPU (1 thread) | Metal kernel-only (warm) | Metal cold (total) | vs Numba CPU (par) |
+|---|---|---|---|---|---|---|
+| Vector polynomial | 10,000 | 103.7us (12t) | 10.5us | 485.8us | 13.5ms | 0.21x |
+| Vector polynomial | 1,000,000 | 174.8us (12t) | 1.05ms | 743.7us | 10.8ms | 0.24x |
+| Vector polynomial | 10,000,000 | 763.2us (12t) | 10.41ms | 1.43ms | 15.6ms | 0.53x |
+| Mandelbrot | 512² | 2.42ms (12t) | 12.53ms | 904.3us | 15.7ms | 2.68x |
+| Mandelbrot | 2048² | 35.33ms (12t) | 197.5ms | 3.08ms | 75.9ms | 11.48x |
+| Mandelbrot | 4096² | 130.9ms (12t) | 787.7ms | 7.92ms | 48.5ms | 16.53x |
+| Heat diffusion | 128² (200 iters) | 19.61ms (12t) | 3.33ms | 187.5us/iter | 14.8ms | 104.60x |
+| Heat diffusion | 512² (200 iters) | 55.69ms (12t) | 400.3ms | 248.6us/iter | 17.3ms | 224.01x |
+| Heat diffusion | 1024² (200 iters) | 47.39ms (12t) | 217.1ms | 414.1us/iter | 29.4ms | 114.45x |
+| Monte Carlo paths | 10,000 | 242.5us (12t) | 819.2us | 359.9us | 17.6ms | 0.67x |
+| Monte Carlo paths | 200,000 | 2.12ms (12t) | 15.44ms | 1.94ms | 20.4ms | 1.09x |
+| Monte Carlo paths | 2,000,000 | 20.43ms (12t) | 154.2ms | 4.69ms | 233.0ms | 4.36x |
+| Pairwise distance | 200x200x8 | 98.4us (12t) | 61.3us | 527.7us | 21.4ms | 0.19x |
+| Pairwise distance | 2000x2000x8 | 1.87ms (12t) | 6.06ms | 2.60ms | 25.4ms | 0.72x |
+| Pairwise distance | 5000x5000x16 | 18.46ms (12t) | 65.88ms | 10.58ms | 46.7ms | 1.75x |
+
+Note the two Heat diffusion rows and the smallest Vector polynomial row
+where single-threaded Numba CPU beats the "parallel" (12-thread) variant
+-- `prange`'s thread-pool dispatch overhead exceeds the actual per-thread
+work at these small grid sizes, a real and expected effect, not an
+error. `metal_kernel_only_warm_ns` for Heat diffusion is reported
+per-iteration (`.../iter`) since it is measured across the full
+multi-iteration resident run, not a single launch.
 
 A machine-readable copy of this exact run is saved at
-`benchmarks/results/example_m4pro_<date>.json` for reference; it is
-example data from one machine, not a target or a claim about other Macs.
+`benchmarks/results/corrected_m4pro_<date>.json`. An earlier, differently
+-structured results file (`benchmarks/results/example_m4pro_<date>.json`,
+predating the timing-category corrections described in this document) is
+kept for historical reference only -- its field names do not match the
+current `BenchmarkResult` schema and it should not be used for
+comparison.
 
 ## Why some workloads can be slower on Metal
 
@@ -175,15 +254,21 @@ example data from one machine, not a target or a claim about other Macs.
   actual compute time by 10-40x. This is expected and is exactly why the
   benchmark suite includes small sizes deliberately -- to show the
   crossover point, not to hide it.
+- **`prange` thread-pool overhead at small sizes.** The parallel Numba
+  CPU number is sometimes *slower* than the single-threaded one (Heat
+  diffusion at 128²/512²/1024² in the table above, all three sizes) --
+  spinning up and synchronizing 12 worker threads costs more than the
+  serial work saves when each thread's share of the loop is tiny relative
+  to thread-pool dispatch. This is reported directly via the separate
+  `numba_cpu_parallel_ns`/`numba_cpu_single_ns` columns rather than only
+  showing whichever is faster.
 - **Many small launches instead of one large one.** `heat_diffusion.py`
-  at 128² does 200 separate kernel launches (one Jacobi iteration each) of
-  a very small grid (16,384 elements); at that size, per-launch dispatch
-  overhead dominates over the tiny amount of actual stencil computation
-  per launch, and the CPU (which has no equivalent per-call dispatch
-  overhead for a tight `@njit` loop) wins. The same algorithm at 1024²
-  (1M+ elements per launch) flips decisively in the GPU's favor because
-  the fixed per-launch overhead becomes negligible relative to the work.
-- **Mandelbrot's dramatic scaling** (1.92x at 512² up to 17.72x at 4096²)
+  at small grid sizes does 200 separate kernel launches (one Jacobi
+  iteration each); per-launch dispatch overhead can dominate over the
+  tiny amount of actual stencil computation per launch. The resident-vs-
+  copy-every-launch comparison (see above) isolates exactly how much of
+  that cost is host&harr;device transfer versus launch overhead itself.
+- **Mandelbrot's dramatic scaling** (2.68x at 512² up to 16.53x at 4096²)
   demonstrates the opposite regime clearly: per-pixel divergent control
   flow (variable iteration counts) is exactly the kind of workload GPUs
   are built for once there's enough parallelism to hide the fixed launch

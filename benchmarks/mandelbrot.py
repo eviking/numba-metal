@@ -21,7 +21,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import (
     BenchmarkResult,
     assert_near_integer_match,
+    infer_launch_arg_types,
+    measure_cold_end_to_end,
+    measure_cold_metal_pipeline,
     require_metal_or_skip,
+    run_single_threaded,
     time_repeated,
 )
 
@@ -47,8 +51,10 @@ def numpy_impl(width: int, height: int, max_iter: int) -> np.ndarray:
     return count
 
 
-def _make_numba_cpu_impl():
+def _make_numba_cpu_impl(*, parallel: bool):
     from numba import njit, prange
+
+    loop_range = prange if parallel else range
 
     # Explicit float32() casts throughout: without them, Numba's CPU
     # target infers float64 for the `0.0`/`3.5`/etc. literals (matching
@@ -61,9 +67,9 @@ def _make_numba_cpu_impl():
     # floating-point precision effect, not a functional bug. Forcing the
     # CPU reference to float32 too makes this an apples-to-apples
     # comparison.
-    @njit(parallel=True, fastmath=False, cache=True)
+    @njit(parallel=parallel, fastmath=False, cache=True)
     def numba_cpu_impl(out, width, height, max_iter):
-        for idx in prange(width * height):
+        for idx in loop_range(width * height):
             px = np.float32(idx % width)
             py = np.float32(idx // width)
             x0 = (px / np.float32(width)) * np.float32(3.5) - np.float32(2.5)
@@ -113,9 +119,7 @@ def _make_metal_kernel():
 
 def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkResult]:
     results = []
-    numba_cpu_impl = _make_numba_cpu_impl()
     metal_available = require_metal_or_skip()
-    metal_kernel = _make_metal_kernel() if metal_available else None
     if metal_available:
         from numba_metal import metal
 
@@ -130,14 +134,31 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
         )
         result.numpy_ns = t_numpy.median_ns
 
+        cpu_parallel = _make_numba_cpu_impl(parallel=True)
         out_cpu = np.empty(width * height, dtype=np.int32)
-        numba_cpu_impl(out_cpu, width, height, max_iter)
-        t_cpu = time_repeated(
-            lambda: numba_cpu_impl(out_cpu, width, height, max_iter),
+        cpu_parallel(out_cpu, width, height, max_iter)
+        t_cpu_par = time_repeated(
+            lambda: cpu_parallel(out_cpu, width, height, max_iter),
             warmup=2,
             repeats=5,
         )
-        result.numba_cpu_ns = t_cpu.median_ns
+        result.numba_cpu_parallel_ns = t_cpu_par.median_ns
+        import numba
+
+        result.numba_cpu_num_threads = numba.get_num_threads()
+
+        cpu_single = _make_numba_cpu_impl(parallel=False)
+        out_cpu_single = np.empty(width * height, dtype=np.int32)
+        cpu_single(out_cpu_single, width, height, max_iter)
+        t_cpu_single = run_single_threaded(
+            lambda: time_repeated(
+                lambda: cpu_single(out_cpu_single, width, height, max_iter),
+                warmup=2,
+                repeats=5,
+            )
+        )
+        result.numba_cpu_single_ns = t_cpu_single.median_ns
+
         # `expected` (vectorized NumPy, float64) is a *different* evaluation
         # order and precision of the same recurrence -- computed here purely
         # for the timing comparison column, not as a correctness oracle for
@@ -150,22 +171,40 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
         )
 
         if metal_available:
+            metal_kernel = _make_metal_kernel()
             d_out = metal.device_array(width * height, np.int32)
             threads = 256
             blocks = (width * height + threads - 1) // threads
 
-            def launch():
-                metal_kernel[blocks, threads](
+            def launch(kernel=None):
+                k = kernel or metal_kernel
+                k[blocks, threads](
                     d_out, np.int32(width), np.int32(height), np.int32(max_iter)
                 )
                 metal.synchronize()
 
-            t_cold = time_repeated(launch, warmup=0, repeats=1)
-            result.metal_cold_ns = t_cold.median_ns
-            t_warm = time_repeated(launch, warmup=2, repeats=5)
-            result.metal_warm_ns = t_warm.median_ns
+            cold = measure_cold_end_to_end(metal_kernel.py_func, launch)
+            result.metal_cold_total_ns = cold["total_ns"]
+            result.compiled_before = cold["compiled_before"]
+            result.compiled_after = cold["compiled_after"]
+
+            arg_types = infer_launch_arg_types(
+                d_out, np.int32(width), np.int32(height), np.int32(max_iter)
+            )
+            phases = measure_cold_metal_pipeline(metal_kernel.py_func, arg_types)
+            result.metal_frontend_ns = phases["frontend_ns"]
+            result.metal_pipeline_compile_ns = phases["pipeline_compile_ns"]
+
+            launch()
+            t_kernel_warm = time_repeated(launch, warmup=2, repeats=5)
+            result.metal_kernel_only_warm_ns = t_kernel_warm.median_ns
             t_d2h = time_repeated(lambda: d_out.copy_to_host(), warmup=1, repeats=5)
             result.metal_d2h_ns = t_d2h.median_ns
+            # No host input data for this kernel (output-only); end-to-end
+            # warm time is kernel + D2H (no H2D input to transfer).
+            result.metal_end_to_end_warm_ns = (
+                result.metal_kernel_only_warm_ns + result.metal_d2h_ns
+            )
 
             # The correctness gate: GPU (float32) vs. scalar CPU (float32,
             # same algorithm) -- an apples-to-apples comparison.
