@@ -275,9 +275,27 @@ def _numeric_expr(draw, dtype: str, ctx: _BuildContext, depth: int = 0) -> str:
             # range keeps the grammar exercising real math-function
             # coverage without generating this known, already-understood,
             # separately-documented divergence as a false differential
-            # -test failure. `min(..., 10.0)` bounds it after the usual
-            # abs()+0.1 shaping.
-            return f"math.exp(min(abs({inner}) + 0.1, 10.0))"
+            # -test failure.
+            #
+            # The clamp bound (4.0, not 10.0) is deliberately tighter than
+            # "just below float32 overflow": found via a genuine exhaustive
+            # -run failure (500-case run, case 215/216) where exp(~9.3)'s
+            # GPU-vs-CPU output already differs by ~1 ULP at that
+            # magnitude (~11106), and that ULP-scale *input* difference,
+            # fed into a subsequent sin()/cos() of a several-thousand-
+            # radian argument, gets amplified by sin/cos's O(1) local
+            # slope into an output difference orders of magnitude larger
+            # than the atol/rtol=1e-3 tolerance -- confirmed by directly
+            # comparing GPU vs. CPU exp() and sin() in isolation for the
+            # exact failing inputs (both math functions individually
+            # match closely; only the composition amplifies the gap).
+            # This is the same *class* of effect as the Mandelbrot
+            # escape-time finding (small float32 precision differences
+            # compounding through a sensitive function), not a new kind
+            # of bug -- keeping exp's output under ~55 keeps sin/cos
+            # arguments small enough that this amplification stays well
+            # under tolerance.
+            return f"math.exp(min(abs({inner}) + 0.1, 4.0))"
         # keep other math function inputs positive-ish and bounded to
         # avoid domain errors (log/sqrt of negative) dominating the
         # search space
