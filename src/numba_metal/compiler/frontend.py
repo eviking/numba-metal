@@ -111,7 +111,12 @@ def make_flags() -> Flags:
     return flags
 
 
-def compile_to_typed_ir(func, arg_types: tuple[nb_types.Type, ...]) -> TypedKernelIR:
+def compile_to_typed_ir(
+    func,
+    arg_types: tuple[nb_types.Type, ...],
+    *,
+    return_type: nb_types.Type | None = nb_types.void,
+) -> TypedKernelIR:
     """Run Numba's frontend and nopython type inference on `func`.
 
     Reuses Numba's bytecode-to-IR translation, control-flow reconstruction,
@@ -120,6 +125,12 @@ def compile_to_typed_ir(func, arg_types: tuple[nb_types.Type, ...]) -> TypedKern
     disabled (`nopython` semantics only, matching CUDA-style kernel
     languages) so an untypeable kernel fails loudly here rather than
     silently compiling to something else.
+
+    `return_type` defaults to `nb_types.void` for ordinary kernels
+    (which never return a value); pass `None` to let Numba infer the
+    return type normally instead -- required for `@metal.device_func`
+    helper functions, which DO return a value (see
+    `msl_backend.py`'s `_compile_device_function`).
     """
     from numba.core.compiler import compile_extra
 
@@ -135,7 +146,7 @@ def compile_to_typed_ir(func, arg_types: tuple[nb_types.Type, ...]) -> TypedKern
             targetctx=targetctx,
             func=func,
             args=arg_types,
-            return_type=nb_types.void,
+            return_type=return_type,
             flags=flags,
             locals={},
             pipeline_class=_TypedIROnlyCompiler,

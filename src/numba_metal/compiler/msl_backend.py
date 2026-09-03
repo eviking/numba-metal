@@ -40,6 +40,8 @@ invalid MSL or drop information the structurer already consumed:
 
 from __future__ import annotations
 
+import itertools
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -84,6 +86,21 @@ _BINOP_MSL = {
 
 #: Supported `math.<name>` functions (task-mandated subset).
 MATH_FUNCS = {"sqrt": "sqrt", "exp": "exp", "log": "log", "sin": "sin", "cos": "cos"}
+
+#: Process-wide monotonic counter for @metal.device_func MSL function
+#: names, mirroring pipeline.py's own `_next_kernel_name` counter but
+#: kept independent to avoid a circular import (pipeline.py already
+#: imports this module).
+_device_function_name_counter = itertools.count()
+_device_function_name_lock = threading.Lock()
+
+
+def _next_device_function_name(func_name: str) -> str:
+    with _device_function_name_lock:
+        n = next(_device_function_name_counter)
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in func_name)
+    return f"nbmtl_devfn_{safe}_{n}"
+
 
 #: metal.atomic_min()/atomic_max(): native MSL atomic_fetch_min/max exist
 #: for int32/uint32 but NOT for float32 (verified directly against
@@ -284,7 +301,50 @@ class _IndentGuard:
 class MSLKernelLowerer:
     """Lowers one TypedKernelIR to a complete MSL `kernel void` function."""
 
-    def __init__(self, kernel_name: str, typed: TypedKernelIR):
+    def __init__(
+        self,
+        kernel_name: str,
+        typed: TypedKernelIR,
+        *,
+        device_function: bool = False,
+        return_type: nb_types.Type | None = None,
+        device_function_cache: dict | None = None,
+    ):
+        # `device_function=True` selects the small set of differences
+        # needed to emit a real, standalone MSL function (`<msl_ty> name
+        # (params) { ...; return expr; }`) instead of a `kernel void`:
+        # `_classify_params` accepts only scalar arguments (no
+        # device-buffer binding, no thread-position parameters -- a
+        # device function has no independent notion of "which thread",
+        # it only ever runs as part of whatever kernel called it),
+        # `_emit_signature` emits an ordinary C-style function signature,
+        # and `ReturnNode` emits `return <value>;` instead of the
+        # kernel-only bare `return;` (kernels never return a value; see
+        # `_emit_node`). Every other codegen path (statement/expression
+        # walking, control-flow structuring, de-SSA) is identical and
+        # fully shared -- this is deliberately NOT a second, duplicated
+        # lowerer class, to avoid the two ever silently drifting apart.
+        self.device_function = device_function
+        self.device_function_return_type = return_type
+        # Shared across one kernel's full compilation (including every
+        # device function it calls, transitively): maps
+        # (original_py_func, arg_types) -> already-emitted MSL function
+        # name, so the same device-function+signature pair compiled from
+        # multiple call sites (or called by more than one kernel in the
+        # same process) is only ever lowered to MSL once. Also used to
+        # detect direct or transitive recursion (see
+        # `_compile_device_function`).
+        self._device_function_cache: dict = (
+            device_function_cache if device_function_cache is not None else {}
+        )
+        # MSL source for every device function this lowering transitively
+        # needed, in the order they were first compiled (dependencies
+        # before dependents is not required in C/MSL as long as every
+        # function is declared before its own body is emitted at the top
+        # level, which this ordering naturally satisfies since a callee
+        # is always fully compiled, by recursion, before its caller's own
+        # call-site code is emitted).
+        self.device_function_sources: list[str] = []
         self.kernel_name = kernel_name
         self.typed = typed
         self.typemap = typed.typemap
@@ -371,6 +431,21 @@ class MSLKernelLowerer:
 
     def _classify_params(self) -> None:
         for name, ty in zip(self.typed.arg_names, self.typed.arg_types, strict=True):
+            if self.device_function:
+                if not isinstance(
+                    ty, (nb_types.Integer, nb_types.Float, nb_types.Boolean)
+                ):
+                    raise UnsupportedFeatureError(
+                        f"@metal.device_func argument {name!r} has "
+                        f"unsupported type {ty!r}. Device functions only "
+                        "support scalar (int32/uint32/int64/float32/"
+                        "float16/bool) arguments -- no arrays, no "
+                        "metal.local_array()/shared_array()."
+                    )
+                self.sig.scalar_params.append((name, ty))
+                self.sig.param_order.append(("scalar", name))
+                self._scalar_names.add(name)
+                continue
             if isinstance(ty, nb_types.Array):
                 if ty.ndim != 1:
                     raise UnsupportedFeatureError(
@@ -395,6 +470,9 @@ class MSLKernelLowerer:
                 )
 
     def _emit_signature(self) -> None:
+        if self.device_function:
+            self._emit_device_function_signature()
+            return
         params: list[str] = []
         buffer_index = 0
         for kind, name in self.sig.param_order:
@@ -439,6 +517,36 @@ class MSLKernelLowerer:
         joined = ",\n    ".join(params)
         self.builder.write(f"kernel void {self.kernel_name}(")
         self.builder.write(f"    {joined})")
+        self.builder.write("{")
+
+    def _emit_device_function_signature(self) -> None:
+        """Emit an ordinary C-style MSL function signature for a
+        `@metal.device_func` (no `[[buffer(n)]]`/thread-position
+        parameters -- those only make sense for a top-level `kernel
+        void` entry point; a device function only ever runs as part of
+        whatever kernel called it, with plain by-value scalar
+        arguments)."""
+        params = []
+        for _kind, name in self.sig.param_order:
+            _, ty = next(s for s in self.sig.scalar_params if s[0] == name)
+            # Same float64->float32 narrowing as the return type below:
+            # a caller passing a bare Python float literal (e.g.
+            # `clamp(x, 0.0, 10.0)`) makes Numba infer that PARAMETER as
+            # float64 (ordinary CPython-matching literal typing), not
+            # because the caller actually wants float64 precision.
+            msl_ty = self._msl_type_for(ty)
+            params.append(f"{msl_ty} arg_{name}")
+        joined = ", ".join(params)
+        # Uses the same float64->float32 local-intermediate narrowing as
+        # ordinary local variables (_msl_type_for), not the stricter
+        # numba_scalar_to_msl (which rejects float64 outright, correct
+        # for kernel ARGUMENTS/array dtypes but not for a device
+        # function's return type -- Python's `return x * 2.0 + 1.0`
+        # infers float64 under ordinary Numba typing rules exactly like
+        # any other local expression, and should be narrowed the same
+        # documented way, not rejected).
+        return_ty = self._msl_type_for(self.device_function_return_type)
+        self.builder.write(f"{return_ty} {self.kernel_name}({joined})")
         self.builder.write("{")
 
     # -- local declarations -----------------------------------------------
@@ -513,12 +621,18 @@ class MSLKernelLowerer:
                     nb_types.Function,
                     nb_types.RangeType,
                     nb_types.NumberClass,
+                    nb_types.Dispatcher,
                 ),
             ):
                 # NumberClass is the type of a dtype *reference* itself
                 # (e.g. the `np.float32` argument passed to
                 # metal.local_array()/shared_array()) -- a compile-time
                 # value with no MSL representation, never read as data.
+                # Dispatcher is the type of an @njit/@metal.device_func
+                # global reference itself (the callee var at a call
+                # site, e.g. `helper` in `helper(x)`) -- also a
+                # compile-time-only value, resolved by `_call`/
+                # `_resolve_global`, never declared or read as data.
                 continue
             if isinstance(ty, nb_types.RangeIteratorType):
                 continue
@@ -853,6 +967,11 @@ class MSLKernelLowerer:
         elif isinstance(node, LoopNode):
             self._emit_loop(node)
         elif isinstance(node, ReturnNode):
+            if self.device_function and node.value is not None:
+                ty = self.typemap.get(node.value.name)
+                if not isinstance(ty, nb_types.NoneType):
+                    self.builder.write(f"return {self._read(node.value)};")
+                    return
             self.builder.write("return;")
         elif isinstance(node, BreakNode):
             self.builder.write("break;")
@@ -1282,6 +1401,7 @@ class MSLKernelLowerer:
                 nb_types.Pair,
                 nb_types.RangeIteratorType,
                 nb_types.NumberClass,
+                nb_types.Dispatcher,
             ),
         ):
             # No MSL declaration exists for these types (see
@@ -1447,9 +1567,81 @@ class MSLKernelLowerer:
             "`.size` on a 1D kernel-argument array is supported."
         )
 
+    def _compile_device_function(
+        self, py_func, arg_types: tuple[nb_types.Type, ...]
+    ) -> str:
+        """Recursively compile a `@metal.device_func`-wrapped `py_func`
+        at `arg_types` to a real, standalone MSL function (memoized by
+        `(py_func, arg_types)` in `self._device_function_cache`, shared
+        across this entire kernel compilation including transitively
+        -called device functions), returning the MSL function's name for
+        the caller to emit a normal call expression against. Detects
+        direct or transitive recursion and raises rather than recursing
+        into Python's own call stack (which would eventually hit
+        RecursionError, or worse, silently produce an infinite MSL
+        function-emission loop for a mutually-recursive pair) --
+        recursion is explicitly out of scope, matching numba-metal's
+        existing "no recursion" restriction for kernels themselves.
+        """
+        from numba_metal.compiler.frontend import compile_to_typed_ir
+
+        cache_key = (py_func, arg_types)
+        if cache_key in self._device_function_cache:
+            cached = self._device_function_cache[cache_key]
+            if cached is None:
+                raise UnsupportedFeatureError(
+                    f"Recursive call to @metal.device_func "
+                    f"{getattr(py_func, '__name__', py_func)!r} detected "
+                    "(directly or transitively) -- recursion is not "
+                    "supported."
+                )
+            return cached
+        # Mark as "in progress" (None) before recursing into the
+        # callee's own body, so a call back to this exact
+        # (py_func, arg_types) pair from within that body -- direct
+        # self-recursion, or a transitive cycle through another device
+        # function -- is detected above instead of recursing forever.
+        self._device_function_cache[cache_key] = None
+
+        typed = compile_to_typed_ir(py_func, arg_types, return_type=None)
+        name = _next_device_function_name(getattr(py_func, "__name__", "device_func"))
+        lowerer = MSLKernelLowerer(
+            name,
+            typed,
+            device_function=True,
+            return_type=typed.return_type,
+            device_function_cache=self._device_function_cache,
+        )
+        body_src = lowerer.lower()
+        # Any device functions THIS device function itself called are
+        # already fully compiled (recursively) by the nested lowerer;
+        # splice their sources in before this function's own, so every
+        # callee is textually declared before its caller (not required
+        # by MSL/C at file scope for functions -- MSL does not require
+        # forward declaration order for top-level function definitions
+        # within one compiled source -- but keeping this ordering makes
+        # the generated source readable top-to-bottom regardless).
+        self.device_function_sources.extend(lowerer.device_function_sources)
+        self.device_function_sources.append(body_src)
+        self._device_function_cache[cache_key] = name
+        return name
+
     def _call(self, target_name: str, expr: ir.Expr) -> None:
         callee = self._resolve_global(expr.func.name)
         args = [self._read(a) for a in expr.args]
+
+        from numba_metal.runtime.dispatcher import (
+            device_function_py_func,
+            is_device_function,
+        )
+
+        if is_device_function(callee):
+            arg_types = tuple(self.typemap[a.name] for a in expr.args)
+            device_func_name = self._compile_device_function(
+                device_function_py_func(callee), arg_types
+            )
+            self._assign(target_name, f"{device_func_name}({', '.join(args)})")
+            return
 
         if callee is bool:
             self._assign(target_name, args[0])

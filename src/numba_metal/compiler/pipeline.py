@@ -107,7 +107,13 @@ def _compile_kernel(func, arg_types: tuple[nb_types.Type, ...]) -> CompiledKerne
     kernel_name = _next_kernel_name(getattr(func, "__name__", "kernel"))
     lowerer = MSLKernelLowerer(kernel_name, typed)
     body_src = lowerer.lower()
-    full_src = _MSL_PRELUDE + body_src
+    # Every @metal.device_func this kernel called (directly or
+    # transitively) was compiled to its own standalone MSL function
+    # during `lower()` (see MSLKernelLowerer._compile_device_function);
+    # those must be declared/defined in the same compilation unit,
+    # before the kernel body that calls them.
+    device_functions_src = "\n".join(lowerer.device_function_sources)
+    full_src = _MSL_PRELUDE + device_functions_src + body_src
 
     if os.environ.get("NUMBA_METAL_DUMP_MSL") == "1":
         print(f"// ---- numba-metal generated MSL: {kernel_name} ----")

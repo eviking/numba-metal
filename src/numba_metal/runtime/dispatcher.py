@@ -318,3 +318,67 @@ def jit(func=None):
     if func is not None:
         return wrap(func)
     return wrap
+
+
+#: CPUDispatcher (the object `@metal.device_func` returns and users call
+#: directly from inside a kernel body, e.g. `helper(a[i])`) -> original
+#: plain Python function. Populated by `device_func` below, consulted by
+#: `msl_backend.py`'s `_call` to recognize a device-function call site
+#: and recursively compile the ORIGINAL function through numba-metal's
+#: own typed-IR-to-MSL pipeline (never the CPUDispatcher's own LLVM
+#: lowering, which is only used to get Numba's frontend to type the call
+#: site the same way it already types an ordinary `@njit` call).
+#:
+#: Module-level (not per-dispatcher) because a device function is a
+#: plain global the user's kernel module defines once and may call from
+#: multiple kernels/other device functions, exactly like `metal.grid`;
+#: it is never mutated after `device_func()` returns, so this is safe to
+#: share across every `KernelDispatcher`/compilation.
+_DEVICE_FUNCTION_REGISTRY: dict[object, object] = {}
+
+
+def device_func(func=None):
+    """`@metal.device_func` decorator: wraps a scalar-argument,
+    scalar-return helper function so it can be called from inside a
+    `@metal.jit` kernel body (or from another `@metal.device_func`),
+    e.g. `helper(a[i])`. Compiled (via numba-metal's own typed-IR-to-MSL
+    pipeline, recursively) to a real, separate MSL function the first
+    time a kernel that calls it is compiled -- not inlined.
+
+    Returns a real `@njit`-compiled dispatcher (so Numba's own frontend
+    types a call to it exactly the way it already types a call to an
+    ordinary `@njit` function -- a `CPUDispatcher` global with a
+    resolved call signature in `calltypes`); numba-metal never runs that
+    dispatcher's own LLVM lowering, only uses it to get the call site
+    typed, then recompiles the original plain function through its own
+    pipeline to produce MSL (see `_DEVICE_FUNCTION_REGISTRY`).
+
+    Only scalar (int32/uint32/int64/float32/float16/bool) argument and
+    return types are supported; no array arguments, no
+    `metal.local_array`/`shared_array`, no recursion (calling a device
+    function from within itself, directly or transitively, is rejected
+    at compile time). See docs/supported-features.md.
+    """
+
+    def wrap(f):
+        from numba import njit
+
+        compiled = njit(cache=False)(f)
+        _DEVICE_FUNCTION_REGISTRY[compiled] = f
+        return compiled
+
+    if func is not None:
+        return wrap(func)
+    return wrap
+
+
+def is_device_function(callee) -> bool:
+    """True if `callee` is a `@metal.device_func`-decorated dispatcher
+    (used by `msl_backend.py` to recognize a device-function call site)."""
+    return callee in _DEVICE_FUNCTION_REGISTRY
+
+
+def device_function_py_func(callee):
+    """The original plain Python function behind a
+    `@metal.device_func`-decorated dispatcher."""
+    return _DEVICE_FUNCTION_REGISTRY[callee]

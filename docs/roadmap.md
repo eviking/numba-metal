@@ -204,16 +204,26 @@ coverage of generated `while`-loop shapes (extending
 `for x in range(...)` loops) before trusting a broader rewrite.
 Complexity: large.
 
-**Device functions** (helper functions callable from a kernel, not just
-the top-level `@metal.jit` function)
-User value: real code reuse/composition instead of one monolithic kernel
-function per launch.
-Dependency: extending the typed-IR frontend to compile a call graph, not
-just a single function; MSL codegen for a callee function plus call-site
-lowering.
-Risk: medium -- inlining vs. real function emission tradeoffs; recursion
-must remain explicitly disallowed.
-Complexity: large.
+**Device functions** -- done for the scalar case. `@metal.device_func`
+compiles a scalar-argument, scalar-return helper function to a real,
+separate MSL function (not inlined), callable from a kernel or another
+device function, with nested calls and full control flow (if/else,
+loops) supported. Direct recursion is rejected by Numba's own frontend;
+mutual/transitive recursion by numba-metal's own cycle detection. Not
+yet done: array-argument device functions (would need buffer-binding
+semantics for a non-top-level MSL function -- a real design question,
+not yet addressed) and MSL-signature-level deduplication (two call
+sites whose Numba-level type tuples differ before numba-metal's
+float64->float32 narrowing but are identical after it currently compile
+to two separate, functionally-identical MSL functions rather than one
+shared one -- an inefficiency, not a correctness issue, see
+`docs/limitations.md`).
+User value (remaining): array arguments would unlock more code-reuse
+patterns (e.g. a helper that reduces over a sub-range of an array).
+Dependency: extending the MSL backend's array-parameter/buffer-binding
+model to a non-kernel-entry-point function.
+Risk: medium.
+Complexity: medium.
 
 **Streams and events**
 User value: overlapping compute with transfer, concurrent independent

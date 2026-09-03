@@ -32,14 +32,14 @@ scale used, and the gaps found and closed while producing that audit.
 | `break` / `continue` in loops | Supported | |
 | `return` (no value) | Supported | Kernels must not return a value |
 | `while` loops | Partially supported | Straight-line body only (no nested `if`/`else`, `break`, or `continue`) -- e.g. a compare-and-swap retry loop or simple accumulation; a `while` with a nested conditional raises `UnsupportedFeatureError` rather than risking the confirmed-possible silent-wrong-result failure mode found during development. See `docs/limitations.md` and `tests/integration/test_while_loops.py`. |
-| Recursion | Unsupported | Not attempted; no call-graph support at all beyond the single kernel function |
+| Recursion | Unsupported | Direct recursion in a `@metal.device_func` is rejected by Numba's own frontend at typing time; mutual/transitive recursion between two device functions is rejected by numba-metal's own in-progress-compilation cycle detection (see `_compile_device_function`) -- both fail with a clear compile-time error, not a stack overflow or hang |
 | Exceptions (`try`/`except`/`raise`) | Unsupported | |
 | Classes | Unsupported | |
 | Strings | Unsupported | |
 | Dictionaries, lists, sets | Unsupported | |
 | f-strings, `print()` | Unsupported | |
 | Closures over outer-scope non-constant variables | Unsupported | Only module-level globals/functions (e.g. `metal`, `math`) are resolved |
-| Device functions (helper functions called from a kernel) | Planned | See `docs/roadmap.md` Phase 3 |
+| Device functions (`@metal.device_func`, helper functions called from a kernel or another device function) | Supported | Scalar arguments and return type only (no arrays, no `metal.local_array`/`shared_array`). Compiled to a real, separate MSL function per distinct call-site signature -- not inlined. Nested device-function calls and control flow (if/else, loops) inside a device function are supported. Compiling the exact same call twice with different Numba-level type tuples that narrow to the same MSL types (e.g. one call site's literal argument types as float64, another's as float32-after-narrowing) currently emits two functionally-identical MSL functions rather than deduplicating by post-narrowing MSL signature -- a real inefficiency, not a correctness issue (each is independently correct), documented in `docs/limitations.md` |
 
 ## Scalar types
 
@@ -122,7 +122,8 @@ scale used, and the gaps found and closed while producing that audit.
 | `NUMBA_METAL_DUMP_MSL=1` / `metal.config.dump_msl` | Supported | |
 | Command-buffer failure propagation | Supported | Every submitted command buffer is tracked through completion; a GPU-side Metal error on any of them is raised (not silently discarded) at the next `synchronize()`/`copy_to_host()`/`copy_to_device()` call |
 | Streams / multiple command queues / events | Unsupported | Single process-wide serial command queue |
-| Device functions / `@vectorize` / ufunc support | Planned | See `docs/roadmap.md` Phase 3 |
+| Device functions (`@metal.device_func`) | Supported | See "Python syntax" above |
+| `@vectorize` / ufunc support | Planned | See `docs/roadmap.md` Phase 3 |
 
 ## Error behavior
 

@@ -23,8 +23,21 @@ gap, not evidence it works.
   values, test a condition, repeat -- e.g. a compare-and-swap retry
   loop, or a simple accumulation) is fully supported and tested. Any
   other unrecognized loop shape still raises `UnsupportedFeatureError`.
-- No recursion, no calling other Python functions from within a kernel
-  (no device-function support yet -- see `docs/roadmap.md`).
+- **Calling other Python functions from within a kernel is supported
+  only via `@metal.device_func`** (a decorator, not calling an
+  arbitrary undecorated function). Scalar arguments and return type
+  only -- no arrays, no `metal.local_array`/`shared_array` inside a
+  device function. Direct recursion is rejected by Numba's own frontend
+  at typing time; mutual/transitive recursion between two device
+  functions is rejected by numba-metal's own in-progress-compilation
+  cycle detection. Each is compiled to a real, separate MSL function
+  (never inlined). A known inefficiency (not a correctness issue): the
+  same call compiled from two call sites whose Numba-level argument/
+  return type tuples differ before narrowing (e.g. one call's literal
+  arguments type as float64, another's as already-float32) but are
+  identical after numba-metal's float64->float32 narrowing currently
+  emits two functionally-identical MSL functions rather than
+  deduplicating by the post-narrowing MSL signature.
 - No exceptions (`try`/`except`/`raise`) inside kernels.
 - No classes, no strings, no dicts/lists/sets, no f-strings, no `print()`.
 - No closures over non-constant outer-scope variables -- only

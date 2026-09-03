@@ -337,6 +337,78 @@ occurrence -- so only the verified-correct straight-line shape is ever
 compiled, and everything else fails loudly at compile time instead of
 silently miscompiling. See `tests/integration/test_while_loops.py`.
 
+### 5. Device functions (`@metal.device_func`)
+
+`@metal.device_func` (`runtime/dispatcher.py`) wraps a scalar-argument,
+scalar-return helper function with `@njit`, and records the mapping
+from the resulting `CPUDispatcher` back to the original plain Python
+function in a module-level `_DEVICE_FUNCTION_REGISTRY` dict. The
+`@njit` wrapping exists purely so Numba's own frontend types a call to
+this function exactly the way it already types a call to any other
+`@njit` function (a `CPUDispatcher` global with a resolved argument/
+return signature in `calltypes`) -- numba-metal never runs that
+dispatcher's own LLVM lowering.
+
+`MSLKernelLowerer._call` recognizes a call to a registered device
+function (`is_device_function(callee)`), and
+`_compile_device_function` recursively runs the ORIGINAL plain function
+through `compile_to_typed_ir` at the call site's exact argument types
+(recovered from `self.typemap`, not `calltypes`, since `calltypes` is
+keyed by the `ir.Expr` object itself and harder to match up generically),
+producing a fresh `TypedKernelIR` for the callee. That is lowered by a
+second `MSLKernelLowerer` instance constructed with `device_function=True`,
+which changes exactly three things from the ordinary kernel path (every
+other codegen method -- statement/expression walking, control-flow
+structuring, de-SSA -- is fully shared, not duplicated):
+
+1. `_classify_params` accepts only scalar arguments (no device-buffer
+   binding, no thread-position parameters -- a device function has no
+   independent notion of "which thread," it only ever runs as part of
+   whatever kernel called it).
+2. `_emit_signature` emits an ordinary C-style MSL function signature
+   (`<msl_ty> name(<msl_ty> arg, ...)`) instead of a `kernel void` with
+   `[[buffer(n)]]`/thread-position parameters.
+3. `ReturnNode` emits `return <value>;` instead of the kernel-only bare
+   `return;` (kernels never return a value).
+
+Compiled device functions are memoized by `(original_py_func,
+arg_types)` in a `_device_function_cache` dict shared across the entire
+kernel compilation (passed down into any nested `MSLKernelLowerer` a
+device function itself constructs for a device function IT calls), so
+the same function+signature compiled from multiple call sites -- or
+called transitively by more than one device function -- is only ever
+lowered to MSL once *for that exact Numba-level type tuple*. This cache
+also doubles as recursion detection: a `(py_func, arg_types)` pair is
+marked "in progress" (`None`) before recursing into the callee's own
+body, so a call back to that exact pair from within it -- direct
+self-recursion, or a transitive cycle through another device function
+(which Numba's own frontend cannot see, since it only ever types one
+function's body per `compile_to_typed_ir` call) -- raises
+`UnsupportedFeatureError` instead of recursing forever in Python's own
+call stack.
+
+Every compiled device function's own MSL source is collected into
+`MSLKernelLowerer.device_function_sources` (including, transitively,
+any device functions IT called), spliced by `pipeline.py`'s
+`_compile_kernel` into the final compiled source ahead of the calling
+kernel's own body.
+
+**Known, documented inefficiency** (not a correctness issue): the cache
+key is the pre-narrowing Numba type tuple, not the post-narrowing MSL
+signature. Two call sites whose Numba-level argument/return types
+differ (e.g. one call's bare float literal arguments infer as float64,
+another call's already-float32 expression) but narrow to the identical
+MSL signature (numba-metal's existing float64->float32 local-
+intermediate narrowing, reused for both device-function parameters and
+return types -- see `_emit_device_function_signature`) currently compile
+to two separate, functionally-identical MSL functions rather than
+deduplicating by the actual MSL signature. Confirmed directly (a
+`clamp(x, lo, hi)` helper called at two sites, one with float32-sourced
+arguments and one where a literal made an argument type float64 before
+narrowing, produced two byte-identical MSL function bodies under
+different names) -- documented in `docs/limitations.md` and
+`docs/roadmap.md` rather than silently left unmentioned.
+
 ## Deliberate precision decisions
 
 - **float64 narrowing.** Python float literals and `/` true-division

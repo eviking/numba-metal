@@ -36,10 +36,11 @@ from numba_metal.runtime.array import (
 )
 from numba_metal.runtime.context import get_context
 from numba_metal.runtime.device import DeviceInfo, check_capable
-from numba_metal.runtime.dispatcher import jit
+from numba_metal.runtime.dispatcher import device_func, jit
 
 __all__ = [
     "jit",
+    "device_func",
     "grid",
     "gridsize",
     "threadgroup_position",
