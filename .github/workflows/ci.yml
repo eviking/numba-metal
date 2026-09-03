@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-cpu-tests:
+    # Runs on GitHub-hosted macOS runners (arm64 where available). These
+    # runners may not always expose a usable Metal device, so this job
+    # runs the non-GPU-dependent parts (lint, frontend/codegen unit
+    # tests) unconditionally. See gpu-tests below for real Metal
+    # execution, which requires a self-hosted Apple-silicon runner.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify architecture
+        run: uname -m
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check src tests benchmarks
+      - name: Format check
+        run: black --check src tests benchmarks
+      - name: Unit tests (no GPU required)
+        run: pytest -m "not metal" -v
+
+  gpu-tests:
+    # Requires a self-hosted runner on real Apple-silicon hardware with a
+    # working Metal device and the Metal Toolchain installed (see
+    # docs/installation.md). Not runnable on standard GitHub-hosted
+    # runners without confirmed Metal device access; disabled by default
+    # until a self-hosted runner is configured (see docs/roadmap.md,
+    # "Automated Apple-silicon testing").
+    if: false
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: GPU integration tests
+        run: pytest -m metal -v
+      - name: Quick benchmark sanity check
+        run: python benchmarks/run_all.py --quick

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "numba-metal"
+version = "0.1.0.dev0"
+description = "An out-of-tree Metal GPU backend for a constrained subset of Numba-style Python kernels, for Apple-silicon Macs."
+readme = "README.md"
+license = { text = "BSD-2-Clause" }
+authors = [{ name = "numba-metal contributors" }]
+requires-python = ">=3.10,<3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numba>=0.59,<0.68",
+    "numpy>=1.24,<3.0",
+    "pyobjc-framework-Metal>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-libdispatch>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.6",
+    "black>=24.0",
+]
+image = [
+    "pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/numba-metal/numba-metal"
+Issues = "https://github.com/numba-metal/numba-metal/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "metal: requires a working Apple-silicon Metal device (deselect with -m 'not metal')",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# These test files define kernel functions solely to feed to the MSL
+# compiler/typing layer under test; the assigned-but-unused locals are
+# the unsupported constructs being tested, not test-logic mistakes.
+"tests/test_unsupported.py" = ["F841"]
+"tests/unit/test_msl_backend.py" = ["F841"]
+"tests/integration/test_end_to_end.py" = ["F841"]
+# Every `lambda: fn(loop_var)` in benchmarks/*.py is passed directly into
+# time_repeated() and invoked synchronously within the same loop
+# iteration, never stored or deferred past it -- B023's late-binding
+# hazard does not apply here, and the alternative (a default-argument
+# capture on every lambda, or a named per-iteration helper function) would
+# hurt readability of already-repetitive benchmark code for no behavioral
+# benefit.
+"benchmarks/*.py" = ["B023"]
