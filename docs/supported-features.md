@@ -11,7 +11,10 @@ Compatibility matrix for the current MVP. Status values:
 - **Planned** -- not implemented; see `docs/roadmap.md`.
 
 Nothing in this document describes behavior that hasn't actually been
-exercised by the test suite in this repository.
+exercised by the test suite in this repository. See
+`docs/feature-traceability.md` for the underlying audit: what specific
+test provides evidence for each "Supported" row, the evidence-level
+scale used, and the gaps found and closed while producing that audit.
 
 ## Python syntax
 
@@ -77,6 +80,7 @@ exercised by the test suite in this repository.
 | `math.cos` | Supported | |
 | Any other `math.*` function (`tan`, `atan2`, `pow`, ...) | Unsupported | Raises `UnsupportedFeatureError` naming the specific function |
 | NumPy ufuncs called inside a kernel (`np.sqrt(x)`, etc.) | Unsupported | Use the `math` module equivalents instead |
+| NumPy scalar dtype constructors inside a kernel body (`np.float32(x)`, `np.uint32(x)`, etc.) | Unsupported | Discovered while adding Workstream 6 test coverage: `out[i] = a[i] + np.uint32(1)` raises `UnsupportedFeatureError`, distinct from the dtype itself being unsupported as an *array* type (see Scalar types above) -- use a plain Python literal (`a[i] + 1`) instead |
 
 ## Memory operations
 
@@ -101,6 +105,7 @@ exercised by the test suite in this repository.
 | 3D launch / `metal.grid(3)` | Unsupported | Raises `UnsupportedFeatureError` naming the requested ndim |
 | `metal.gridsize(ndim)` | Supported | Total dispatched thread count along each dimension |
 | Invalid launch geometry (zero/negative blocks or threads, threads exceeding device limit) | Rejected | Raises `KernelLaunchError` before any GPU work is submitted |
+| Zero-length device arrays | Partially supported | `metal.to_device()`, `device_array()`, `device_array_like()`, and `copy_to_host()` all handle a zero-length array correctly; there is no zero-block launch path, so `kernel[0, threads](...)` is rejected by the same `KernelLaunchError` as any other zero/negative launch dimension -- a caller with a zero-length array must skip the launch entirely rather than pass 0 blocks |
 
 ## Synchronization and execution
 

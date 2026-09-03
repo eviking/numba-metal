@@ -271,10 +271,15 @@ def test_grid_2d_matches_reference() -> None:
     assert np.array_equal(result, expected)
 
 
-def test_metal_compilation_error_reports_msl_and_diagnostic() -> None:
-    """A kernel that fails Numba typing never reaches Metal compilation, so
-    this test verifies the alternate honest failure path: an unsupported
-    construct raises before any GPU work is attempted."""
+def test_unsupported_construct_rejected_before_metal_compilation() -> None:
+    """A kernel that fails Numba's own typed-IR frontend (a dict literal
+    is not a supported construct) never reaches Metal shader compilation
+    at all -- this is the frontend-rejection path, distinct from
+    `test_real_metal_compilation_error_reports_diagnostic_and_msl` below,
+    which exercises an actual Metal compiler failure. Conflating the two
+    would overstate what this test demonstrates (previously this test was
+    named as if it covered a genuine Metal compiler error; its own
+    docstring already admitted it did not)."""
     from numba_metal.errors import NumbaMetalError
 
     metal = _metal()
@@ -291,3 +296,46 @@ def test_metal_compilation_error_reports_msl_and_diagnostic() -> None:
         d_a = metal.to_device(np.zeros(10, dtype=np.float32))
         d_out = metal.device_array(10, np.float32)
         bad[1, 16](d_a, d_out)
+
+
+def test_real_metal_compilation_error_reports_diagnostic_and_msl() -> None:
+    """Exercises a genuine Apple Metal shader-compiler failure (not a
+    Numba frontend rejection): `MSLKernelLowerer.lower` is monkeypatched
+    to emit deliberately syntactically-invalid MSL body text, so the
+    kernel passes numba-metal's own frontend/codegen but is rejected by
+    `device.newLibraryWithSource_options_error_` -- the real Metal
+    compiler, given real invalid MSL, on real hardware. This is the only
+    way to trigger this path deterministically: numba-metal's own
+    codegen never emits invalid MSL for any currently-supported
+    construct, so there is no ordinary kernel source that reaches this
+    failure organically. `KernelCompilationError` must include both
+    Metal's own diagnostic text (file:line, the exact syntax errors) and
+    the full generated MSL source, so a real generator bug is
+    debuggable from the exception alone."""
+    from numba_metal.compiler.msl_backend import MSLKernelLowerer
+    from numba_metal.errors import KernelCompilationError
+
+    metal = _metal()
+
+    def _broken_lower(self):
+        return "kernel void broken_body( this is not valid MSL !!! ) {}\n"
+
+    original_lower = MSLKernelLowerer.lower
+    MSLKernelLowerer.lower = _broken_lower
+    try:
+
+        @metal.jit
+        def bad(a, out):
+            i = metal.grid(1)
+            if i < out.size:
+                out[i] = a[i]
+
+        d_a = metal.to_device(np.zeros(4, dtype=np.float32))
+        d_out = metal.device_array(4, np.float32)
+        with pytest.raises(KernelCompilationError) as exc_info:
+            bad[1, 4](d_a, d_out)
+        message = str(exc_info.value)
+        assert "MTLLibraryErrorDomain" in message or "error:" in message
+        assert "broken_body" in message
+    finally:
+        MSLKernelLowerer.lower = original_lower
