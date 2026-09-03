@@ -442,13 +442,20 @@ Metal"` / `"'goto' is not supported in Metal"`), which is what motivated
 building the structured-control-flow reconstruction described above
 instead.
 
-**numba/numba#5706.** The task's investigation instructions named this
-open feature request as something to review before implementation. It
-was not actually reviewed -- no fetch or read of it happened during this
-project, despite an earlier draft of this document claiming otherwise;
-that claim was false and has been removed. No content from it influenced
-anything in this codebase. This should be treated as an open item, not a
-completed and negative-result investigation step.
+**numba/numba#5706.** Read in full during Workstream 7 (see
+`docs/numba-rfc.md`), after the architecture above had already been
+built -- so it did not influence any implementation decision in this
+codebase, but it does independently corroborate the "Why this
+architecture" rationale below: Numba maintainers and contributors
+discussing that issue over several years (2020-2025) repeatedly
+concluded there is no known way to target Metal from Numba's LLVM IR
+(no public AIR/air64 backend, no documented Metal Shader Converter path
+from arbitrary LLVM IR), and explicitly characterized a real solution as
+"a research project," not an incremental addition. This matches the
+"MSL is text, not an LLVM target" conclusion this project reached
+independently. See `docs/numba-rfc.md` for the full findings and
+`docs/upstream-strategy.md` for what this implies about staying an
+out-of-tree, non-`target_extension`-registered backend.
 
 ## Why this architecture
 

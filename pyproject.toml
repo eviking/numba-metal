@@ -9,22 +9,20 @@ description = "An out-of-tree Metal GPU backend for a constrained subset of Numb
 readme = "README.md"
 license = { text = "BSD-2-Clause" }
 authors = [{ name = "numba-metal contributors" }]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.12,<3.14"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: BSD License",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Compilers",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "numba>=0.59,<0.68",
+    "numba>=0.67,<0.68",
     "numpy>=1.24,<3.0",
     "pyobjc-framework-Metal>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-libdispatch>=10.0; sys_platform == 'darwin'",
@@ -58,11 +56,11 @@ markers = [
 
 [tool.black]
 line-length = 88
-target-version = ["py310", "py311", "py312", "py313"]
+target-version = ["py312", "py313"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

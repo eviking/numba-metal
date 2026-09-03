@@ -12,14 +12,26 @@ jobs:
     # runs the non-GPU-dependent parts (lint, frontend/codegen unit
     # tests) unconditionally. See gpu-tests below for real Metal
     # execution, which requires a self-hosted Apple-silicon runner.
+    #
+    # The Python matrix covers exactly the versions in
+    # docs/numba-rfc.md's compatibility table that have actually been
+    # run against this test suite (3.12, 3.13) -- matching
+    # pyproject.toml's requires-python = ">=3.12,<3.14". Numba is
+    # pinned by pyproject.toml's own dependency bound
+    # (numba>=0.67,<0.68); this job installs whatever that bound
+    # resolves to rather than pinning a second, possibly-inconsistent
+    # version here.
     runs-on: macos-14
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - name: Verify architecture
         run: uname -m
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install package
         run: pip install -e ".[dev]"
       - name: Lint
@@ -35,14 +47,18 @@ jobs:
     # docs/installation.md). Not runnable on standard GitHub-hosted
     # runners without confirmed Metal device access; disabled by default
     # until a self-hosted runner is configured (see docs/roadmap.md,
-    # "Automated Apple-silicon testing").
+    # "Automated Apple-silicon testing"). When enabled, this should also
+    # matrix across the same Python versions as lint-and-cpu-tests above.
     if: false
     runs-on: [self-hosted, macOS, ARM64]
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install package
         run: pip install -e ".[dev]"
       - name: GPU integration tests

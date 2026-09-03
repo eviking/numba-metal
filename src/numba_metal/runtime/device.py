@@ -126,11 +126,16 @@ def check_metal_compiler() -> str:
 
 
 def check_capable() -> DeviceInfo:
-    """Run all platform/device/toolchain checks; return DeviceInfo on success.
+    """Run all platform/device/toolchain/Numba-version checks; return
+    DeviceInfo on success.
 
     This is the single entry point `metal.jit` and `metal` module import
-    should use to fail fast with a clear error on unsupported machines.
+    should use to fail fast with a clear error on unsupported machines
+    or an unvalidated Numba version.
     """
+    from numba_metal.compat import check_numba_compatible
+
+    check_numba_compatible()
     info = get_device_info()
     check_metal_compiler()
     return info
