@@ -35,6 +35,9 @@ dev = [
     "pytest>=7.4",
     "ruff>=0.6",
     "black>=24.0",
+    "hypothesis>=6.100",
+    "build>=1.2",
+    "twine>=5.0",
 ]
 image = [
     "pillow>=10.0",

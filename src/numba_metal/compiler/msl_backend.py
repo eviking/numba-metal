@@ -220,6 +220,11 @@ class MSLKernelLowerer:
         # `it = <pair_first-derived temp>` copy in a detected for-range
         # loop; see _suppress_loop_protocol_names.
         self._suppressed_copy_stmts: set[int] = set()
+        # Monotonic counter for the range-bound snapshot temporaries
+        # `_emit_loop` introduces (v__range_start_N/stop_N/step_N), so
+        # that a kernel with multiple/nested for-range loops gets a
+        # distinct, non-colliding set of MSL identifiers for each one.
+        self._range_snapshot_counter = 0
 
     def lower(self) -> str:
         """Run the full typed-IR-to-MSL lowering and return the generated
@@ -598,16 +603,35 @@ class MSLKernelLowerer:
     def _emit_loop(self, node: LoopNode) -> None:
         for_info = self._detect_for_range(node)
         if for_info is not None:
-            start, stop, step = (
-                for_info.bounds.start,
-                for_info.bounds.stop,
-                for_info.bounds.step,
-            )
             var = for_info.loop_var_ident
+            # Python's `range(start, stop, step)` evaluates start/stop/step
+            # exactly ONCE, when the loop begins -- they are never re-read
+            # even if the loop body later reassigns the variable(s) that
+            # fed them (e.g. `for j in range(m): ... m = 0`, a real case
+            # found by the differential/property-based test suite,
+            # Workstream 4). A native MSL `for (init; cond; incr)` header
+            # re-evaluates its `cond` expression every iteration, so
+            # substituting the raw stop/step expressions directly into
+            # `cond` (as an earlier version of this function did) would
+            # silently pick up any later mutation of the variables they
+            # reference -- changing the trip count mid-loop and diverging
+            # from Python/Numba CPU semantics. Capturing each bound into
+            # its own MSL-declared, uniquely-named temporary evaluated
+            # once, immediately before the `for` header, reproduces the
+            # correct once-only evaluation regardless of what the loop
+            # body does to the source variables afterward.
+            snapshot_id = self._range_snapshot_counter
+            self._range_snapshot_counter += 1
+            start_var = f"v__range_start_{snapshot_id}"
+            stop_var = f"v__range_stop_{snapshot_id}"
+            step_var = f"v__range_step_{snapshot_id}"
+            self.builder.write(f"long {start_var} = {for_info.bounds.start};")
+            self.builder.write(f"long {stop_var} = {for_info.bounds.stop};")
+            self.builder.write(f"long {step_var} = {for_info.bounds.step};")
             self.builder.write(
-                f"for ({var} = {start}; "
-                f"({step} > 0) ? ({var} < {stop}) : ({var} > {stop}); "
-                f"{var} += {step}) {{"
+                f"for ({var} = {start_var}; "
+                f"({step_var} > 0) ? ({var} < {stop_var}) : ({var} > {stop_var}); "
+                f"{var} += {step_var}) {{"
             )
             with self.builder.block():
                 self._emit_node(node.body)
@@ -706,6 +730,25 @@ class MSLKernelLowerer:
         # entry block). These are ir.Var assigns, not phi exprs (see
         # _trace_to_range_call), so DeSSAPass never touches them -- follow
         # the copy chain to its end instead of assuming a single hop.
+        # Stop as soon as the chain reaches a real, user-visible Python
+        # variable name (Numba's compiler-generated SSA temporaries are
+        # always prefixed with `$`; a plain identifier like `j3` never
+        # is). This is required, not just an optimization: continuing to
+        # follow "any assignment that happens to copy this value" beyond
+        # that point is unsound, because a real user statement --
+        # entirely unrelated to the loop-iterator-protocol chain, e.g.
+        # `n = j3` inside the loop body -- is itself exactly such a copy
+        # assignment, and the previous unconditional "follow every copy
+        # forward" logic would walk straight into it and misidentify an
+        # unrelated variable as the loop's induction variable. Found by
+        # the exhaustive differential test suite (Workstream 4): a
+        # generated kernel containing `for j3 in range(...): ... n = j3`
+        # (reassigning a scalar kernel *argument* from the loop variable)
+        # produced MSL where the `for` loop's own induction variable was
+        # wrongly identified as `n` instead of `j3`, leaving `j3` itself
+        # referenced-but-undeclared elsewhere in the body.
+        if not first_target.startswith("$"):
+            return first_target
         current = first_target
         for _ in range(len(self.func_ir.blocks) + 1):
             next_hop = None
@@ -722,6 +765,8 @@ class MSLKernelLowerer:
                     break
             if next_hop is None:
                 return current
+            if not next_hop.startswith("$"):
+                return next_hop
             current = next_hop
         return current
 
@@ -844,8 +889,38 @@ class MSLKernelLowerer:
                 nb_types.Function,
                 nb_types.RangeType,
                 nb_types.Pair,
+                nb_types.RangeIteratorType,
             ),
         ):
+            # No MSL declaration exists for these types (see
+            # _declare_locals/_msl_type_for, which skip them the same
+            # way) -- they are Python-iterator-protocol bookkeeping
+            # (getiter()'s own RangeIteratorType result, iternext()'s
+            # Pair result) with no runtime representation in generated
+            # MSL. This check must stay in sync with _declare_locals's
+            # skip list: previously RangeIteratorType was declared-skip
+            # only, not assign-skip, which let a plain `ir.Var` copy
+            # assignment whose target has this type (e.g. seeding a
+            # loop's iterator into its per-iteration phi slot) reach this
+            # method and emit an assignment to an identifier that was
+            # never declared. This only manifested when the surrounding
+            # loop had no back-edge left in the CFG for the structurer to
+            # recognize as a LoopNode (e.g. a `for` loop whose body
+            # provably breaks unconditionally on iteration 0, which
+            # Numba's own optimizer reduces to a back-edge-free CFG) --
+            # in that shape, _detect_for_range/_suppress_loop_protocol_names
+            # never runs at all (they are only invoked for a recognized
+            # LoopNode), so nothing else suppressed this assignment.
+            # Found by the differential/property-based test suite
+            # (Workstream 4): `for j in range(n): if True: break` (i.e.
+            # a loop that unconditionally exits on its first iteration)
+            # produced MSL referencing undeclared identifiers before this
+            # fix. Skipping by type here, unconditionally, is strictly
+            # more robust than the structural (LoopNode-gated) suppression
+            # this bug was found in: no assignment to a value of a type
+            # with no MSL representation should ever be emitted, whether
+            # or not the surrounding control flow was recognized as a
+            # loop.
             return
         ident = self._ident(target_name)
         self.builder.write(f"{ident} = {expr_text};")
@@ -975,11 +1050,31 @@ class MSLKernelLowerer:
         if callee is abs:
             self._assign(target_name, f"abs({args[0]})")
             return
-        if callee is min:
-            self._assign(target_name, f"min({args[0]}, {args[1]})")
-            return
-        if callee is max:
-            self._assign(target_name, f"max({args[0]}, {args[1]})")
+        if callee is min or callee is max:
+            # MSL's min/max are C++-style overloaded functions requiring
+            # both arguments to share exactly one concrete type; Metal's
+            # shader compiler reports "call to 'min'/'max' is ambiguous"
+            # rather than silently promoting mixed-width arguments (e.g.
+            # `min(int32_val, int64_val)` -- Numba's own type inference
+            # already promotes such a call's *result* type to the wider
+            # operand's type, matching ordinary Python/Numba numeric
+            # promotion, so casting both arguments to that already-known
+            # result type here reproduces Numba's promotion semantics
+            # exactly rather than reimplementing promotion rules
+            # independently. Found by the differential/property-based
+            # test suite (Workstream 4): `min(int32_arg, int64_literal)`
+            # inside a generated kernel failed real Metal compilation
+            # with exactly this "ambiguous call" error before this fix.
+            result_ty = self.typemap.get(target_name)
+            msl_result_ty = (
+                self._msl_type_for(result_ty) if result_ty is not None else None
+            )
+            fname = "min" if callee is min else "max"
+            if msl_result_ty is not None:
+                casted = [f"{msl_result_ty}({a})" for a in args]
+                self._assign(target_name, f"{fname}({casted[0]}, {casted[1]})")
+            else:
+                self._assign(target_name, f"{fname}({args[0]}, {args[1]})")
             return
         if callee is float:
             self._assign(target_name, f"float({args[0]})")
