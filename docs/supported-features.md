@@ -85,8 +85,8 @@ exercised by the test suite in this repository.
 | `metal.to_device(array)` | Supported | |
 | `metal.device_array(shape, dtype)` | Supported | |
 | `metal.device_array_like(array)` | Supported | |
-| `device_array.copy_to_host()` | Supported | |
-| `device_array.copy_to_device(host_array)` | Supported | |
+| `device_array.copy_to_host()` | Supported | Synchronizes with all outstanding GPU work first -- see docs/architecture.md, "Host/device synchronization model" |
+| `device_array.copy_to_device(host_array)` | Supported | Synchronizes with all outstanding GPU work first, for the same reason (prevents a host write racing an in-flight kernel's reads of the same shared-memory buffer -- verified by a regression test, see docs/architecture.md) |
 | GPU-resident arrays across multiple kernel launches | Supported | Demonstrated by `benchmarks/heat_diffusion.py` |
 | Zero-copy host<->device (no memcpy at all) | Unsupported | Current implementation performs a host-side memcpy into/out of a shared-storage-mode `MTLBuffer` on every `to_device`/`copy_to_host` call, even though the underlying memory is unified -- see `docs/architecture.md` and `docs/limitations.md` |
 | Threadgroup (shared) memory | Planned | See `docs/roadmap.md` Phase 2 |
@@ -106,10 +106,11 @@ exercised by the test suite in this repository.
 
 | Feature | Status | Notes |
 |---|---|---|
-| `metal.synchronize()` | Supported | Blocks on a barrier command buffer |
+| `metal.synchronize()` | Supported | Waits on and inspects the status/error of every outstanding tracked command buffer (not a single barrier); raises `MetalRuntimeError` naming the specific failing kernel and submission number -- see docs/architecture.md, "Command-buffer tracking and error propagation" |
 | Repeated kernel launches | Supported | |
 | Compilation cache (source + signature + device) | Supported | In-process only; not persisted to disk (see `docs/roadmap.md`) |
 | `NUMBA_METAL_DUMP_MSL=1` / `metal.config.dump_msl` | Supported | |
+| Command-buffer failure propagation | Supported | Every submitted command buffer is tracked through completion; a GPU-side Metal error on any of them is raised (not silently discarded) at the next `synchronize()`/`copy_to_host()`/`copy_to_device()` call |
 | Streams / multiple command queues / events | Unsupported | Single process-wide serial command queue |
 | Device functions / `@vectorize` / ufunc support | Planned | See `docs/roadmap.md` Phase 3 |
 

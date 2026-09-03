@@ -103,6 +103,19 @@ gap, not evidence it works.
 - No streams, multiple command queues, or asynchronous transfer overlap
   with compute -- a single process-wide serial command queue is used for
   everything.
+- **Every `copy_to_host()`/`copy_to_device()` call is a full
+  synchronization boundary.** Both wait for *all* currently outstanding
+  GPU work (every submitted kernel, not just ones touching the specific
+  buffer involved) before touching host/device memory. This is
+  deliberately conservative rather than fine-grained per-buffer
+  dependency tracking; it is correct but means a host transfer on a
+  buffer with no relationship to an unrelated in-flight kernel will still
+  wait for that kernel to finish. See `docs/architecture.md`, "Host/device
+  synchronization model", for why this is necessary (host reads/writes of
+  shared-memory buffers race outstanding GPU work otherwise -- this was
+  confirmed by deliberately removing the synchronization and observing an
+  in-flight kernel's actual output change) and the roadmap for a possible
+  future per-buffer tracker.
 
 ## Numerical differences
 

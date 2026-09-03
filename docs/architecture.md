@@ -285,6 +285,43 @@ counting owns the `MTLBuffer` for the `DeviceNDArray`'s lifetime; a
 no-copy wrapper would need to additionally keep the source NumPy array
 alive for as long as the GPU might reference its memory).
 
+### Host/device synchronization model (Workstream 3)
+
+Because a shared-storage-mode buffer's memory is the *same* memory on
+both sides, a host-side read or write that runs concurrently with an
+outstanding GPU kernel touching that memory is a genuine data race, not
+merely a staleness concern -- the GPU could read a half-written host
+update, the host could read a value the GPU hasn't finished computing, or
+both could write concurrently. This was confirmed empirically, not just
+reasoned about: with the synchronization call described below removed
+for testing, a kernel reading a buffer across roughly 2000 iterations,
+immediately followed by an unsynchronized host-side overwrite of that
+same buffer, was observed to have the kernel's *actual measured output*
+reflect the new, overwritten values instead of the values present at
+launch time -- i.e. the host write measurably raced ahead of and
+corrupted the in-flight kernel's input (see
+`tests/integration/test_host_device_sync.py`, and its regression against
+this exact failure mode).
+
+The MVP's model is deliberately conservative rather than a fine-grained
+per-buffer dependency tracker: **every** `DeviceNDArray.copy_to_host()`
+call and **every** `DeviceNDArray.copy_to_device()` call (including the
+write inside `to_device()`) unconditionally calls `metal.synchronize()`
+first -- waiting for *all* currently outstanding command buffers (see
+"Command-buffer tracking and error propagation" above), not just ones
+that happen to reference the specific buffer being touched. This is
+coarser than strictly necessary (a `copy_to_host()` on buffer A will also
+wait for an unrelated in-flight kernel touching only buffer B), but it is
+unconditionally correct without needing to build and maintain a
+per-buffer dependency tracker, which was judged out of scope for this
+pass in favor of a design that is simple enough to be confidently
+correct. A consequence worth being explicit about: every `copy_to_host()`
+or `copy_to_device()` call is a synchronization boundary, full stop --
+this is also what makes `copy_to_host()` a reliable place to observe a
+preceding kernel's GPU-side failure (see the command-buffer tracking
+section above): it cannot return partial or in-flight data that would
+mask a `MetalRuntimeError` a synchronize() would otherwise raise.
+
 ## Dispatch and synchronization
 
 `numba_metal/runtime/dispatcher.py`'s `KernelDispatcher` implements

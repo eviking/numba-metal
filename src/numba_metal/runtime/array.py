@@ -12,6 +12,43 @@ an existing NumPy allocation directly, or handing the MTLBuffer's memory
 to NumPy as its backing store) is listed in the roadmap; it is legal Metal
 API surface via MTLDevice.newBufferWithBytesNoCopy_length_options_deallocator_,
 but was left out of the MVP to keep buffer lifetime rules simple.
+
+# Host/device synchronization model (Workstream 3)
+
+Unified memory means a shared-storage-mode `MTLBuffer`'s backing memory is
+literally the same memory the GPU reads and writes -- there is no
+coherence-protocol copy step to wait for, but there is no ordering
+guarantee either: nothing stops the CPU from reading or overwriting that
+memory *while* a previously-submitted, not-yet-complete kernel is still
+executing against it, if the host access were allowed to happen without
+first waiting. That is a genuine data race (the GPU could read a
+half-written host update, or the host could read a value the GPU hasn't
+finished computing yet, or both could write concurrently), not merely a
+staleness/ordering inconvenience. This was verified concretely, not just
+argued: a kernel reading a buffer for ~2000 iterations, immediately
+followed by an unsynchronized `copy_to_device()` overwrite of that same
+buffer from the host, was observed (before this fix) to have the kernel's
+output reflect the *new*, overwritten values instead of the values that
+were present when it was launched -- i.e. the host write actually raced
+ahead of and corrupted the in-flight kernel's input. See
+`tests/integration/test_host_device_sync.py`.
+
+The MVP's synchronization model is deliberately conservative rather than
+a fine-grained per-buffer dependency tracker (matching the assignment's
+explicit preference for correctness over sophistication for this pass):
+**every** host-side read of a device buffer (`copy_to_host`) and **every**
+host-side write to one (`copy_to_device`, including the write inside
+`to_device`) first calls `metal.synchronize()`, unconditionally. This
+waits for *all* outstanding GPU work on *any* buffer, not just the one
+being touched -- coarser than strictly necessary, but correct
+unconditionally: since numba-metal has no way (yet) to know which
+in-flight kernels reference which specific buffer without dedicated
+per-buffer dependency tracking, waiting for all of them is the only sound
+choice available without building that tracker. This is documented
+explicitly, here and in docs/architecture.md/docs/limitations.md, as a
+real, deliberate performance/simplicity tradeoff: a `copy_to_host()` or
+`copy_to_device()` call is a synchronization boundary, full stop, even
+when it touches a buffer no in-flight kernel is anywhere near.
 """
 
 from __future__ import annotations
@@ -61,7 +98,17 @@ class DeviceNDArray:
         return self._buffer
 
     def copy_to_host(self, out: np.ndarray | None = None) -> np.ndarray:
-        """Copy this array's contents back into a new (or provided) NumPy array."""
+        """Copy this array's contents back into a new (or provided) NumPy array.
+
+        Synchronizes first (unconditionally, like `copy_to_device` -- see
+        this module's docstring, "Host/device synchronization model"), so
+        a preceding kernel's GPU-side failure (see
+        `numba_metal.runtime.context.SubmissionRecord`/`synchronize`)
+        cannot be silently bypassed by reading stale or in-flight results:
+        `copy_to_host()` always surfaces it as a `MetalRuntimeError`
+        instead of returning whatever partial/undefined data happened to
+        be in the buffer.
+        """
         get_context().synchronize()
         ptr = self._buffer.contents()
         raw = ptr.as_buffer(self.nbytes)
@@ -73,12 +120,22 @@ class DeviceNDArray:
 
     def copy_to_device(self, host_array: np.ndarray) -> None:
         """Overwrite this device array's contents from a NumPy array of the
-        same shape and dtype. Used internally and by `to_device`."""
+        same shape and dtype. Used internally and by `to_device`.
+
+        Synchronizes first: without waiting for outstanding GPU work, this
+        write could race a previously-submitted kernel that is still
+        reading or writing the same shared-memory buffer (see this
+        module's docstring, "Host/device synchronization model"). This is
+        true for a brand-new buffer with no prior kernel activity too --
+        the check is unconditional, not buffer-specific, since numba-metal
+        does not (yet) track which in-flight kernels touch which buffers.
+        """
         if host_array.shape != self.shape:
             raise MetalRuntimeError(
                 f"Shape mismatch copying to device: array is {self.shape}, "
                 f"host data is {host_array.shape}."
             )
+        get_context().synchronize()
         src = np.ascontiguousarray(host_array, dtype=self.dtype)
         ptr = self._buffer.contents()
         raw = ptr.as_buffer(self.nbytes)
