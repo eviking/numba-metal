@@ -1,0 +1,22 @@
+include LICENSE
+include README.md
+
+# The sdist ships only what's needed to build and install the package
+# (see docs/architecture.md's packaging hygiene note); tests, benchmarks,
+# docs, and dev artifacts are available from the source repository, not
+# duplicated into the distribution.
+prune tests
+prune benchmarks
+prune docs
+prune examples
+prune artifacts
+prune scripts
+prune .github
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
+global-exclude __MACOSX
+global-exclude *.nbc
+global-exclude *.nbi
+global-exclude *.metallib
