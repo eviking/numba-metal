@@ -163,11 +163,17 @@ class KernelDispatcher:
         encoder.setComputePipelineState_(compiled.pipeline_state)
 
         buffer_index = 0
-        # Keep small scalar-constant buffers alive until commit(); Metal
-        # does not copy `constant` buffer contents at encode time for
-        # newBufferWithBytes-style buffers, it references the MTLBuffer
-        # itself, so these must not be garbage-collected before submission.
-        keepalive = []
+        # Every Metal resource this dispatch touches -- argument array
+        # buffers, synthesized scalar/size constant buffers, and the
+        # pipeline state -- is retained here and handed to
+        # `register_submission` so it cannot be garbage-collected while
+        # the GPU may still be reading/writing it, for as long as this
+        # command buffer is outstanding (see runtime/context.py). This
+        # replaces the previous MVP's `addCompletedHandler_` closure
+        # trick, which only kept small scalar buffers alive and did
+        # nothing to let a caller observe *when* or *whether* the work
+        # actually completed successfully.
+        resources: list[object] = [compiled.pipeline_state]
         device = ctx.device
 
         for (kind, name), value in zip(
@@ -175,17 +181,18 @@ class KernelDispatcher:
         ):
             if kind == "array":
                 dev_array: DeviceNDArray = value
+                resources.append(dev_array.buffer)
                 encoder.setBuffer_offset_atIndex_(dev_array.buffer, 0, buffer_index)
                 buffer_index += 1
                 size_buf = _scalar_buffer(device, np.uint32(dev_array.size))
-                keepalive.append(size_buf)
+                resources.append(size_buf)
                 encoder.setBuffer_offset_atIndex_(size_buf, 0, buffer_index)
                 buffer_index += 1
             else:
                 info = next(s for s in compiled.signature.scalar_params if s[0] == name)
                 np_dtype = _numba_scalar_to_numpy(info[1])
                 scalar_buf = _scalar_buffer(device, np_dtype.type(value))
-                keepalive.append(scalar_buf)
+                resources.append(scalar_buf)
                 encoder.setBuffer_offset_atIndex_(scalar_buf, 0, buffer_index)
                 buffer_index += 1
 
@@ -199,8 +206,13 @@ class KernelDispatcher:
         tg_size = Metal.MTLSizeMake(tg_x, tg_y, 1)
         encoder.dispatchThreads_threadsPerThreadgroup_(grid_size, tg_size)
         encoder.endEncoding()
-        cmdbuf.addCompletedHandler_(lambda _cb, _keep=keepalive: None)
         cmdbuf.commit()
+        ctx.register_submission(
+            command_buffer=cmdbuf,
+            kernel_name=compiled.name,
+            resources=resources,
+            msl_source=compiled.msl_source,
+        )
 
 
 def _scalar_buffer(device, np_scalar):

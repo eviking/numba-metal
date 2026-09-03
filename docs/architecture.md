@@ -297,10 +297,55 @@ each scalar argument gets its own small constant buffer), and encodes a
 `dispatchThreads:threadsPerThreadgroup:` call on a fresh command buffer
 from the shared queue, then commits it.
 
-`metal.synchronize()` (`context.py`) commits an empty barrier command
-buffer and waits on it; because the single command queue executes
-command buffers in submission order, waiting on this barrier guarantees
-everything submitted before it has completed.
+### Command-buffer tracking and error propagation
+
+Every dispatched command buffer is registered with the process-wide
+`_MetalContext` as a `SubmissionRecord` (`context.py`): kernel name, the
+command buffer object itself, every Metal resource the dispatch used
+(argument array buffers, synthesized scalar/size constant buffers, the
+pipeline state) retained for the buffer's outstanding lifetime, a
+monotonic submission sequence number, and the generated MSL source for
+diagnostics.
+
+`metal.synchronize()` waits on **every** currently outstanding command
+buffer (not a single barrier), then inspects each one's
+`status()`/`error()` individually and raises `MetalRuntimeError` naming
+the specific failing kernel and submission number. This replaced an
+earlier design that committed one empty "barrier" command buffer and
+waited only on that, relying on the single serial `MTLCommandQueue`'s
+in-order execution to *infer* everything earlier had also finished --
+which established ordering correctly but never inspected the status of
+the actual kernel command buffers, so a kernel-level Metal error could be
+silently discarded as long as the (trivially always-successful, since it
+has no work) barrier itself completed. Two properties this rules out
+specifically: an earlier failure cannot be hidden by a later, unrelated
+buffer completing successfully (every outstanding buffer is checked, not
+just the most recent), and a failure is never inferred by catching a
+Python exception raised inside an `addCompletedHandler_` callback --
+Metal invokes completion handlers on its own internal dispatch queue, and
+an exception raised there does not propagate to the Python thread that
+called `synchronize()`; status/error are instead read synchronously,
+in-thread, immediately after `waitUntilCompleted()` returns.
+
+`synchronize()` drains its whole pending list atomically (under a
+dedicated lock separate from the one-time device-init lock) before
+waiting on any of it, so repeated calls -- including a second
+`synchronize()` immediately after one that raised -- are safe: there is
+nothing left to re-wait on, and no deadlock risk from waiting twice on an
+already-completed buffer.
+
+A deliberately, deterministically failing *real* Metal submission could
+not be safely constructed for testing this: out-of-bounds GPU memory
+access is undefined behavior on Apple GPUs and was verified empirically
+(during this project's own development) not to reliably surface as a
+command-buffer error status, so relying on it would itself be an
+unsafe, non-reproducible test. Failure-status handling is therefore
+unit-tested against a fake command-buffer object with a fully scripted
+`status()`/`error()`
+(`tests/unit/test_command_buffer_tracking.py`), and the success path
+(multiple real launches tracked and cleanly drained, resource lifetime
+across real async completion) is separately verified on real Metal
+hardware (`tests/integration/test_command_buffer_tracking_metal.py`).
 
 ## Error handling
 
