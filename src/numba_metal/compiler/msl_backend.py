@@ -21,10 +21,16 @@ Two SSA-specific patterns get dedicated handling rather than a literal
 per-instruction translation, because a literal translation would either be
 invalid MSL or drop information the structurer already consumed:
 
-1. **Phi nodes.** MSL (like C) has no SSA phi; a phi target and all of its
-   incoming values are unified to one shared MSL variable identifier via a
-   union-find pre-pass (`_PhiUnifier`), so ordinary assignment on each
-   incoming path already leaves the right value visible after the merge.
+1. **Phi nodes.** MSL (like C) has no SSA phi. Phi elimination is handled
+   by the isolated `numba_metal.compiler.dessa` pass, which computes
+   edge-correct parallel-copy assignments (never aliases two SSA variables
+   to one shared identifier -- see `dessa.py`'s module docstring for why
+   that would be unsound). Every SSA variable, including every phi target,
+   gets its own independent MSL declaration; this backend only asks
+   `DeSSAResult` for (a) which names are phi targets that must be declared
+   but never assigned via their `phi` statement itself, and (b) which
+   `Copy` assignments to emit immediately after each basic block's own
+   statements.
 2. **`for x in range(...)`.** Numba lowers this to `getiter`/`iternext`/
    `pair_first`/`pair_second` plus a phi-carried loop variable. Rather than
    reconstruct an equivalent iterator protocol in MSL, the backend detects
@@ -41,6 +47,7 @@ from numba.core import ir
 from numba.core import types as nb_types
 
 from numba_metal.compiler import intrinsics
+from numba_metal.compiler.dessa import DeSSAPass, DeSSAResult
 from numba_metal.compiler.frontend import TypedKernelIR
 from numba_metal.compiler.structuring import (
     BasicBlockNode,
@@ -124,37 +131,6 @@ def _numba_fn_to_opstr(fn) -> str:
     return getattr(fn, "__name__", str(fn))
 
 
-class _UnionFind:
-    def __init__(self):
-        self._parent: dict[str, str] = {}
-
-    def find(self, x: str) -> str:
-        self._parent.setdefault(x, x)
-        while self._parent[x] != x:
-            self._parent[x] = self._parent[self._parent[x]]
-            x = self._parent[x]
-        return x
-
-    def union(self, a: str, b: str) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self._parent[rb] = ra
-
-
-def _unify_phis(blocks: dict[int, ir.Block]) -> dict[str, str]:
-    """Union every phi target with each of its incoming vars; return a map
-    from every SSA var name that participates in a phi to one canonical
-    representative name (used as the MSL identifier for all of them)."""
-    uf = _UnionFind()
-    for block in blocks.values():
-        for stmt in block.body:
-            if isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr):
-                if stmt.value.op == "phi":
-                    for incoming in stmt.value.incoming_values:
-                        uf.union(stmt.target.name, incoming.name)
-    return uf
-
-
 @dataclass
 class _RangeCallInfo:
     start: str
@@ -167,10 +143,20 @@ class _ForRangeLoopInfo:
     test traces back to a `range()`-derived iterator in the expected shape.
     """
 
-    def __init__(self, loop_var_ident: str, loop_var_name: str, bounds: _RangeCallInfo):
+    def __init__(
+        self,
+        loop_var_ident: str,
+        loop_var_name: str,
+        bounds: _RangeCallInfo,
+        range_target: str,
+    ):
         self.loop_var_ident = loop_var_ident
         self.loop_var_name = loop_var_name
         self.bounds = bounds
+        # The SSA name of the `range(...)` call feeding this specific
+        # loop's iterator, used to scope iterator-protocol suppression to
+        # this loop only (see _suppress_loop_protocol_names).
+        self.range_target = range_target
 
 
 class MSLFunctionBuilder:
@@ -217,7 +203,7 @@ class MSLKernelLowerer:
         self.sig = KernelSignatureInfo()
         self._globals: dict[str, object] = {}
         self._range_calls: dict[str, list[str]] = {}
-        self._phi_uf: _UnionFind | None = None
+        self._dessa: DeSSAResult | None = None
         self._array_names: set[str] = set()
         self._scalar_names: set[str] = set()
         # Var names that exist only to implement Python's iterator protocol
@@ -240,11 +226,11 @@ class MSLKernelLowerer:
         `kernel void` function source (excluding the `#include`/`using`
         prelude, added by the caller)."""
         self._classify_params()
-        self._phi_uf = _unify_phis(self.func_ir.blocks)
         self._collect_globals()
         self._collect_range_calls()
         entry = min(self.func_ir.blocks.keys())
         structured = structure_function(self.func_ir.blocks, entry)
+        self._dessa = DeSSAPass(self.func_ir.blocks).run(structured)
         self._compute_suppressed_names(structured)
         self._emit_signature()
         with self.builder.block():
@@ -306,20 +292,22 @@ class MSLKernelLowerer:
 
     # -- local declarations -----------------------------------------------
 
-    def _canonical(self, var_name: str) -> str:
-        if self._phi_uf is not None:
-            return self._phi_uf.find(var_name)
-        return var_name
-
     @staticmethod
-    def _ident(canonical_name: str) -> str:
-        safe = "".join(
-            ch if (ch.isalnum() or ch == "_") else "_" for ch in canonical_name
-        )
+    def _ident(var_name: str) -> str:
+        """MSL identifier for a given SSA variable name. Every distinct
+        SSA name maps to its own distinct identifier -- no aliasing."""
+        safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in var_name)
         return "v_" + safe
 
     def _declare_locals(self) -> None:
-        seen_canonical: dict[str, str] = {}
+        # Every distinct SSA variable name -- including every phi target --
+        # gets its own independent MSL declaration. Nothing is aliased or
+        # collapsed: this is the core correctness property the de-SSA
+        # rewrite establishes (see dessa.py's module docstring). A phi
+        # target (name in self._dessa.phi_targets) is declared exactly
+        # like any other local; its value comes from the Copy assignments
+        # DeSSAPass computed for each incoming edge, emitted by
+        # _emit_basic_block, not from the (never-emitted) `phi` statement.
         for name, ty in self.typemap.items():
             if name in self._array_names or name in self._scalar_names:
                 continue
@@ -344,18 +332,50 @@ class MSLKernelLowerer:
                 continue
             if isinstance(ty, nb_types.RangeIteratorType):
                 continue
-            canonical = self._canonical(name)
-            if canonical in seen_canonical:
-                continue
             try:
                 msl_ty = self._msl_type_for(ty)
             except UnsupportedFeatureError as exc:
                 raise UnsupportedFeatureError(f"{exc} (variable {name!r})") from exc
             if msl_ty is None:
                 continue
-            ident = self._ident(canonical)
+            ident = self._ident(name)
             self.builder.write(f"{msl_ty} {ident};")
-            seen_canonical[canonical] = ident
+        self._declare_dessa_temporaries()
+
+    def _declare_dessa_temporaries(self) -> None:
+        """Declare the synthetic temporaries DeSSAPass introduces to break
+        copy cycles (e.g. a loop-carried swap `a, b = b, a`). Each such
+        temp is a plain copy of some phi target's value, so it shares that
+        target's already-validated MSL type -- see
+        `dessa._sequentialize_parallel_copies`, which names every such
+        temp `__dessa_tmp<n>__<target>` specifically so its origin target
+        (and therefore its type) can be recovered here."""
+        if self._dessa is None:
+            return
+        declared: set[str] = set()
+        for copies in self._dessa.edge_copies.values():
+            for copy in copies:
+                if not copy.target.startswith("__dessa_tmp"):
+                    continue
+                if copy.target in declared:
+                    continue
+                # copy.source at declaration time is always the original
+                # phi-target variable this temporary preserves the value
+                # of (see _sequentialize_parallel_copies: the temp is
+                # created as `Copy(target=temp, source=victim.target)`).
+                origin_ty = self.typemap.get(copy.source)
+                if origin_ty is None:
+                    raise UnsupportedFeatureError(
+                        f"Internal error: de-SSA temporary {copy.target!r} "
+                        f"has no type information for its origin "
+                        f"{copy.source!r}."
+                    )
+                msl_ty = self._msl_type_for(origin_ty)
+                if msl_ty is None:
+                    continue
+                ident = self._ident(copy.target)
+                self.builder.write(f"{msl_ty} {ident};")
+                declared.add(copy.target)
 
     def _range_call_target_names(self) -> set[str]:
         names: set[str] = set()
@@ -462,29 +482,49 @@ class MSLKernelLowerer:
         elif isinstance(node, LoopNode):
             for_info = self._detect_for_range(node)
             if for_info is not None:
-                self._suppress_loop_protocol_names(node, for_info.loop_var_name)
+                self._suppress_loop_protocol_names(
+                    node, for_info.loop_var_name, for_info.range_target
+                )
             self._compute_suppressed_names(node.body)
 
-    def _suppress_loop_protocol_names(self, node: LoopNode, loop_var_name: str) -> None:
+    def _suppress_loop_protocol_names(
+        self, node: LoopNode, loop_var_name: str, range_target: str
+    ) -> None:
+        """Mark this *specific* loop's iterator-protocol bookkeeping
+        variables as suppressed. Scoped strictly to `range_target` (the
+        exact `range(...)` call feeding this loop's `getiter`) so that,
+        with nested for-range loops, resolving the inner loop's protocol
+        names can never walk into and re-suppress the outer loop's -- each
+        loop's transitive copy-chain closure is seeded fresh from only its
+        own getiter/iternext/pair_first/pair_second names, never from the
+        shared, ever-growing `self._suppressed_names` accumulated by
+        previously processed loops (that was the root cause of a real bug
+        found by tests/integration/test_phi_dessa.py's nested-loop case:
+        the inner loop's closure scan matched on "source name is already
+        suppressed" against the *global* set, which by then already
+        contained the outer loop's getiter result, and followed its copy
+        chain all the way to the outer loop's own `j`).
+        """
         header_block = self.func_ir.blocks[node.header_label]
+        local: set[str] = set()
         for stmt in header_block.body:
             if not (isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr)):
                 continue
             if stmt.value.op in ("iternext", "pair_first", "pair_second", "getiter"):
-                self._suppressed_names.add(stmt.target.name)
+                local.add(stmt.target.name)
         # The `getiter()` call itself lives in the block that jumps into
         # the loop header (e.g. block 66 for header 156), not in the
         # header block, so it is not caught by the scan above; find it
-        # directly from the range() call site instead.
+        # directly from this loop's own range() call site instead.
         for block in self.func_ir.blocks.values():
             for stmt in block.body:
                 if (
                     isinstance(stmt, ir.Assign)
                     and isinstance(stmt.value, ir.Expr)
                     and stmt.value.op == "getiter"
-                    and stmt.value.value.name in self._range_calls
+                    and stmt.value.value.name == range_target
                 ):
-                    self._suppressed_names.add(stmt.target.name)
+                    local.add(stmt.target.name)
         # Copy assignments chain loop-protocol values through plain
         # `ir.Var` assigns (not `op=="phi"` exprs -- see
         # _trace_to_range_call), both to seed the iterator into the
@@ -493,7 +533,8 @@ class MSLKernelLowerer:
         # the pair_first result). Propagate suppression transitively
         # across such copies (fixed point) so both are caught regardless
         # of how many hops separate them from the original getiter/
-        # pair_first/pair_second target.
+        # pair_first/pair_second target -- but seeded from and bounded by
+        # `local` (this loop only), not the global accumulated set.
         changed = True
         while changed:
             changed = False
@@ -515,12 +556,10 @@ class MSLKernelLowerer:
                         # a suppressed *statement* by object identity.
                         self._suppressed_copy_stmts.add(id(stmt))
                         continue
-                    if (
-                        stmt.value.name in self._suppressed_names
-                        and stmt.target.name not in self._suppressed_names
-                    ):
-                        self._suppressed_names.add(stmt.target.name)
+                    if stmt.value.name in local and stmt.target.name not in local:
+                        local.add(stmt.target.name)
                         changed = True
+        self._suppressed_names |= local
 
     # -- structured-node emission ------------------------------------------
 
@@ -606,9 +645,9 @@ class MSLKernelLowerer:
                     pair_second_name = stmt.target.name
         if iternext_val_name is None:
             return None
-        if pair_second_name is None or self._canonical(
-            pair_second_name
-        ) != self._canonical(self._exit_cond_source_name(node)):
+        if pair_second_name is None or pair_second_name != self._exit_cond_source_name(
+            node
+        ):
             return None
 
         range_target = self._trace_to_range_call(iternext_val_name)
@@ -627,9 +666,8 @@ class MSLKernelLowerer:
         pair_first_name = self._find_pair_first_target(header_block, iternext_val_name)
         if pair_first_name is None:
             return None
-        loop_var_canonical = self._canonical(pair_first_name)
         return _ForRangeLoopInfo(
-            self._ident(loop_var_canonical), pair_first_name, bounds
+            self._ident(pair_first_name), pair_first_name, bounds, range_target
         )
 
     def _exit_cond_source_name(self, node: LoopNode) -> str:
@@ -665,8 +703,8 @@ class MSLKernelLowerer:
         # result eventually gets copied into, via a chain of plain
         # var-to-var copy assigns (commonly two hops: pair_first's target
         # -> the header's per-iteration phi slot -> `it` in the loop body
-        # entry block). These are ir.Var assigns, not phi exprs, so the
-        # union-find doesn't unify them (see _trace_to_range_call); follow
+        # entry block). These are ir.Var assigns, not phi exprs (see
+        # _trace_to_range_call), so DeSSAPass never touches them -- follow
         # the copy chain to its end instead of assuming a single hop.
         current = first_target
         for _ in range(len(self.func_ir.blocks) + 1):
@@ -720,6 +758,30 @@ class MSLKernelLowerer:
     def _emit_basic_block(self, node: BasicBlockNode) -> None:
         for stmt in node.body:
             self._emit_stmt(stmt)
+        self._emit_edge_copies(node.label)
+
+    def _emit_edge_copies(self, block_label: int) -> None:
+        """Emit the parallel-copy assignments DeSSAPass computed for the
+        CFG edge leaving `block_label` (i.e. this block is a phi's
+        `incoming_block`). This is the single place phi resolution
+        produces MSL text; see dessa.py for why per-edge copies -- not
+        aliasing -- are required for correctness, and structuring.py for
+        why `block_label`'s position in the structured tree is always the
+        unique, correct point for "control just took this edge"."""
+        if self._dessa is None:
+            return
+        for copy in self._dessa.edge_copies.get(block_label, []):
+            target_ident = self._ident(copy.target)
+            source_ident = self._ident_for_copy_source(copy.source)
+            self.builder.write(f"{target_ident} = {source_ident};")
+
+    def _ident_for_copy_source(self, name: str) -> str:
+        """Resolve a Copy's source name to an MSL expression: either a
+        kernel argument, a declared local/phi-temp, or (for a temporary
+        DeSSAPass introduced to break a copy cycle) its own identifier."""
+        if name in self._array_names or name in self._scalar_names:
+            return f"arg_{name}"
+        return self._ident(name)
 
     # -- statements ----------------------------------------------------
 
@@ -785,8 +847,7 @@ class MSLKernelLowerer:
             ),
         ):
             return
-        canonical = self._canonical(target_name)
-        ident = self._ident(canonical)
+        ident = self._ident(target_name)
         self.builder.write(f"{ident} = {expr_text};")
 
     # -- expressions -----------------------------------------------------
@@ -812,7 +873,12 @@ class MSLKernelLowerer:
         elif op == "call":
             self._call(target_name, expr)
         elif op == "phi":
-            pass  # handled by union-find; no MSL emitted for the phi itself
+            # The phi statement itself is never emitted -- its target is
+            # declared as an ordinary local (see _declare_locals) and
+            # assigned only via the per-edge Copy statements DeSSAPass
+            # computed, emitted by _emit_edge_copies wherever each
+            # incoming block's own statements finish. See dessa.py.
+            pass
         elif op == "exhaust_iter":
             # Numba inserts `exhaust_iter` when unpacking a fixed-size
             # tuple (`x, y = metal.grid(2)`); it is an identity copy of
@@ -963,8 +1029,7 @@ class MSLKernelLowerer:
         if name in self._array_names or name in self._scalar_names:
             return f"arg_{name}"
         if name in self.typemap:
-            canonical = self._canonical(name)
-            return self._ident(canonical)
+            return self._ident(name)
         raise UnsupportedFeatureError(f"Reference to undeclared variable {name!r}.")
 
     def _const_text(self, py_val, target_name: str) -> str:

@@ -1,0 +1,42 @@
+numba-metal benchmark suite
+  Mac: MacBook Pro (Apple M4 Pro)
+  macOS 26.5.1, Python 3.13.5, Numba 0.67.0, numba-metal 0.1.0.dev0
+  GPU: Apple M4 Pro
+
+--- Vector polynomial ---
+  (0.5s)
+
+--- Mandelbrot ---
+  (32.4s)
+
+--- Heat diffusion ---
+  (2.9s)
+
+--- Monte Carlo paths ---
+  (6.5s)
+
+--- Pairwise distance ---
+  (3.9s)
+
+====================================================================================================
+Benchmark          Size          Python    NumPy     Numba CPU  Metal warm  Metal total  vs Numba  Correct
+----------------------------------------------------------------------------------------------------------
+Vector polynomial  10,000        835.38us  12.92us   9.38us     523.83us    11.25ms      0.02x     yes    
+Vector polynomial  1,000,000     N/A       640.17us  936.04us   975.62us    1.38ms       0.96x     yes    
+Vector polynomial  10,000,000    N/A       6.75ms    9.50ms     1.65ms      6.19ms       5.77x     yes    
+Mandelbrot         512²          N/A       69.09ms   2.05ms     1.07ms      14.12ms      1.92x     yes    
+Mandelbrot         2048²         N/A       1.196s    30.93ms    3.07ms      10.57ms      10.09x    yes    
+Mandelbrot         4096²         N/A       4.896s    123.60ms   7.14ms      21.38ms      17.31x    yes    
+Heat diffusion     128²          N/A       3.10ms    3.31ms     41.17ms     N/A          0.08x     yes    
+Heat diffusion     512²          N/A       32.68ms   52.47ms    40.70ms     N/A          1.29x     yes    
+Heat diffusion     1024²         N/A       129.11ms  210.03ms   65.81ms     N/A          3.19x     yes    
+Monte Carlo paths  10,000        N/A       1.81ms    210.33us   299.42us    8.27ms       0.70x     yes    
+Monte Carlo paths  200,000       N/A       41.61ms   2.28ms     1.53ms      4.46ms       1.49x     yes    
+Monte Carlo paths  2,000,000     N/A       423.35ms  20.45ms    6.46ms      63.95ms      3.16x     yes    
+Pairwise distance  200x200x8     10.96ms   493.83us  138.42us   595.08us    13.81ms      0.23x     yes    
+Pairwise distance  2000x2000x8   N/A       37.94ms   1.67ms     1.71ms      6.16ms       0.97x     yes    
+Pairwise distance  5000x5000x16  N/A       265.88ms  17.38ms    10.63ms     27.97ms      1.63x     yes    
+
+Correctness: 15/15 results passed.
+
+Wrote JSON results to artifacts/baseline/benchmark_results.json

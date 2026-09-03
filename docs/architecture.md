@@ -100,11 +100,99 @@ structurer (`structuring.py`):
   `UnsupportedFeatureError` naming the offending block, rather than
   emitting incorrect MSL.
 
-SSA `phi` nodes are eliminated by a union-find pass
-(`_unify_phis`) that assigns one shared MSL variable identifier to a phi
-target and all of its incoming values, so ordinary assignment on each
-predecessor path already leaves the correct value visible after the
-merge -- no MSL is emitted for the phi node itself.
+### 1b. De-SSA: correct phi-node elimination
+
+`numba_metal/compiler/dessa.py` is an isolated pass that eliminates
+Numba's SSA `phi` nodes with edge-correct parallel-copy assignments. This
+replaced an earlier union-find scheme (aliasing a phi's target and every
+incoming SSA variable to one shared MSL identifier) that was
+**theoretically unsound**: an incoming SSA variable can remain live after
+the merge point through a different name or a different phi chain, and
+forcing it to share storage with the phi target means a later write can
+silently clobber a value that must stay unchanged (the classic "lost
+copy" hazard from SSA-destruction literature -- Briggs et al. 1998;
+Boissinot et al. 2009). Differential testing against the union-find
+scheme's actual compiled output did not surface a live miscompilation
+from *that specific mechanism* (Numba's bytecode frontend happens to
+insert temporaries at exactly the points naive coalescing would
+otherwise be unsafe, e.g. a tuple swap `x, y = y, x` lowers through a
+temporary rather than a direct cross-assignment) -- but that is a
+property of the inputs this frontend happens to produce today, not a
+guarantee the scheme itself enforced, so it was replaced regardless of
+whether a live bug had been demonstrated.
+
+**The algorithm** (see `dessa.py`'s module docstring for the full
+rationale):
+
+1. **No aliasing.** Every distinct SSA variable name -- including every
+   phi target -- gets its own independent MSL declaration. Nothing is
+   ever unioned or collapsed.
+2. **Per-edge resolution using Numba's explicit incoming-block data.**
+   Numba's phi IR node (`ir.Expr.phi`) carries two parallel arrays,
+   `incoming_values` and `incoming_blocks`, with `incoming_values[k]`
+   corresponding to `incoming_blocks[k]` by construction (verified
+   directly against the installed Numba version's `ir.Expr.phi`
+   definition, not assumed). `dessa.py` uses `zip(incoming_values,
+   incoming_blocks, strict=True)` exclusively -- never dict iteration
+   order, never positional inference from anything else -- to build,
+   for every phi, the exact set of `(predecessor_block, value)` pairs
+   that must produce an assignment `phi_target := value` if and only if
+   control reached the merge via that predecessor.
+3. **Structural placement, no explicit edge-splitting data structure.**
+   Because the structurer (`structuring.py`) already guarantees a
+   *reducible*, structured tree (anything irreducible already raises
+   `UnsupportedFeatureError` during structuring, before de-SSA runs),
+   every CFG predecessor block appears in exactly one place in the
+   structured tree, on exactly one path into the merge. `dessa.py`
+   therefore locates that `BasicBlockNode` by its CFG label and the
+   backend (`msl_backend.py`'s `_emit_edge_copies`) appends the copy
+   immediately after that block's own statements are emitted -- which is
+   precisely "the end of the unique control path constituting this
+   edge." This sidesteps needing a literal critical-edge-splitting
+   transform: the structured tree's shape already resolves "did control
+   reach the merge via predecessor P" unambiguously for every reducible
+   region, including loop headers (whose two edges -- the pre-loop entry
+   and the loop's own back-edge -- are simply two more predecessor
+   blocks with their own unique structural locations, one before the
+   loop and one inside its body).
+4. **Parallel-copy semantics via dependency sequentialization.** When
+   multiple phis fire on the same edge (e.g. a loop-carried swap `a, b =
+   b, a`, which produces two simultaneous copies on the loop's back-edge),
+   naively emitting them in declaration order can read an
+   already-overwritten value. `dessa._sequentialize_parallel_copies`
+   treats the edge's copy set as a dependency graph (`Copy(target=T,
+   source=S)` is an edge `S -> T`), repeatedly emits any copy whose
+   target no other pending copy still needs to read, and -- if only
+   cycles remain -- breaks one with a synthesized temporary that captures
+   the pre-copy value before it would otherwise be overwritten
+   (Boissinot et al. 2009's algorithm, applied to the small copy sets --
+   typically 1-4 -- phi resolution produces in practice). Each such
+   temporary is declared with the MSL type of the value it preserves
+   (`MSLKernelLowerer._declare_dessa_temporaries`).
+5. **Defensive validation, not silent trust.** `DeSSAPass.run()` accepts
+   the structured tree and checks that every phi's incoming block
+   actually appears in it; if structuring ever produced a tree that
+   dropped a predecessor edge (e.g. a future change to `structuring.py`
+   introduces a gap), this raises a specific internal error rather than
+   silently placing that edge's copy nowhere.
+
+**A concrete bug this replacement's own test suite found**: building the
+required differential tests (`tests/integration/test_phi_dessa.py`,
+covering phi-target liveness, same-edge multi-phi, parallel-copy swaps,
+copy cycles, nested if/else, ternaries, loop-carried accumulation, nested
+loops, break/continue interactions, multi-way merges, and positive/negative
+range steps) surfaced a real, previously untested bug in a *different*
+mechanism: nested `for`-range loops could have the inner loop's
+iterator-protocol-name suppression (which hides Python's
+getiter/iternext/pair_first/pair_second bookkeeping from MSL output, a
+mechanism unrelated to phi elimination) walk through the outer loop's
+already-suppressed `getiter` result and incorrectly suppress the outer
+loop's own induction variable, producing MSL referencing an undeclared
+identifier. That was fixed by scoping each loop's suppression scan to
+only its own `range()` call site (`_suppress_loop_protocol_names`), not
+the whole function. This is documented here as a concrete demonstration
+of why every correctness claim in this codebase is backed by an
+executable test against real Metal execution, not an argument alone.
 
 ### 2. Statement/expression codegen
 

@@ -4,6 +4,21 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
 build/
 dist/
 *.metallib
+.DS_Store
+__MACOSX/
+.numba_cache/
+*.nbc
+*.nbi
+
+# Large generated evidence artifacts: kept locally for inspection, not
+# committed. See artifacts/README.md.
+artifacts/differential/*.json
+artifacts/differential/*.log
+artifacts/final/*.json
+artifacts/final/*.txt
+!artifacts/final/.gitkeep
+!artifacts/differential/.gitkeep

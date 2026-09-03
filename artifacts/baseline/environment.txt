@@ -1,0 +1,32 @@
+=== Git commit ===
+d769250342090c51fbe6bb024f8bcff1e0165ac3
+
+=== Hardware ===
+Kernel: Darwin 25.5.0 (arm64)
+Model: MacBook Pro (Mac16,8), Apple M4 Pro, 12 cores (8P+4E), 24GB RAM
+
+=== macOS ===
+ProductName:		macOS
+ProductVersion:		26.5.1
+BuildVersion:		25F80
+
+=== Metal ===
+      Metal Support: Metal 4
+      Displays:
+
+=== Python / venv ===
+Python 3.13.5
+/Users/jensschutt/Documents/projects/metal/numba-metal/.venv/bin/python3
+
+=== Installed packages (relevant) ===
+black                        26.5.1
+llvmlite                     0.49.0
+numba                        0.67.0
+numba-metal                  0.1.0.dev0 /Users/jensschutt/Documents/projects/metal/numba-metal
+numpy                        2.5.2
+pyobjc-core                  12.2.2
+pyobjc-framework-Cocoa       12.2.2
+pyobjc-framework-libdispatch 12.2.2
+pyobjc-framework-Metal       12.2.2
+pytest                       9.1.1
+ruff                         0.16.5
