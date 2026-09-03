@@ -94,15 +94,22 @@ achievable on this machine, not merely theoretical.
 
 5. **numba/numba#5706** (the open feature request for a Metal backend) was
    named in the task's mandatory-investigation list but was **not
-   actually reviewed** during this implementation. No WebFetch/WebSearch/
-   read of it was performed at any point in this session, despite an
-   earlier draft of this document asserting it had been -- that assertion
-   was false and has been corrected. No content from it informed any
-   decision in this codebase. This is a real investigation gap, not a
-   stylistic omission: if it contains relevant prior art or expectations
-   from the Numba maintainers/community, that has not been checked. See
-   `docs/roadmap.md` for where a real review would fit (Phase 5,
-   maintainer coordination).
+   actually reviewed** during this (original MVP) implementation. No
+   WebFetch/WebSearch/read of it was performed at any point in that
+   session, despite an earlier draft of this document asserting it had
+   been -- that assertion was false and was corrected at the time. No
+   content from it informed any decision in the codebase built during
+   that session.
+
+   **Update (post-MVP hardening pass):** the issue was read in full
+   during that later pass, after the architecture below had already
+   been built, so it still did not influence any implementation
+   decision -- but it does independently corroborate this project's own
+   "MSL is text, not LLVM IR" conclusion (see `docs/architecture.md`,
+   "Alternatives considered," and `docs/numba-rfc.md` for the full
+   findings). The investigation gap described above is accurate history
+   for the MVP session it describes and is left as-is rather than
+   rewritten.
 
 ## Build order (executed in this order)
 

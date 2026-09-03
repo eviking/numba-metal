@@ -72,24 +72,30 @@ gap, not evidence it works.
 ## Compilation latency
 
 - First-time compilation of a given kernel+signature (Numba typed-IR
-  frontend + Apple's Metal shader compiler) takes anywhere from a few
-  milliseconds to several tens of milliseconds depending on kernel
-  complexity, measured directly in this repository's own benchmark suite
-  (`metal_cold_ns` in `benchmarks/*.py` output). There is no persistent,
-  cross-process compilation cache in the MVP -- every new Python process
-  recompiles every kernel from scratch on first launch. See
-  `docs/roadmap.md` Phase 1.
+  frontend + MSL lowering + Apple's Metal shader/pipeline compilation)
+  takes roughly 10-235ms total depending on kernel complexity, measured
+  and separated into phases directly in this repository's own benchmark
+  suite (`metal_frontend_ns`, `metal_pipeline_compile_ns`,
+  `metal_cold_total_ns` in `benchmarks/*.py` / `docs/benchmarking.md`
+  output, each confirmed genuinely cold via a before/after compiled-
+  kernel-count check). There is no persistent, cross-process compilation
+  cache in the MVP -- every new Python process recompiles every kernel
+  from scratch on first launch. See `docs/roadmap.md` Phase 1.
 
 ## GPU dispatch overhead
 
 - Every kernel launch has fixed overhead (command buffer encoding, buffer
   binding, dispatch, and this project's `synchronize()`-before-returning
   benchmark convention). Measured directly: at small problem sizes (e.g.
-  10,000-element vector polynomial, 200x200 pairwise distance, 128²
-  heat-diffusion grid), this overhead makes the GPU *slower* than Numba
-  CPU by 5-50x -- see `docs/benchmarking.md` for the actual numbers. This
-  is expected GPU behavior, not a defect, but it means numba-metal is not
-  a good fit for small, latency-sensitive workloads.
+  10,000-element vector polynomial, 200x200 pairwise distance), the
+  kernel-only warm GPU time is slower than parallel Numba CPU by roughly
+  1.4x-5.3x -- see `docs/benchmarking.md` for the full, separated-by-
+  category numbers (and note that Numba's own `prange` thread-pool
+  dispatch overhead can *also* make its parallel variant slower than
+  single-threaded at these same small sizes, an independent effect
+  reported there too). This is expected GPU-dispatch behavior, not a
+  defect, but it means numba-metal is not a good fit for small,
+  latency-sensitive workloads.
 
 ## Memory-transfer behavior
 
@@ -163,8 +169,21 @@ gap, not evidence it works.
   `docs/architecture.md`).
 - Only one Numba version (0.67.0) has actually been exercised end-to-end
   against real GPU execution while building this package. The declared
-  compatible range in `pyproject.toml` is a bound, not a claim that every
-  version in it has been tested.
+  compatible range in `pyproject.toml` (`>=0.67,<0.68`) is narrowed to
+  match exactly that -- it is not a claim that a wider range has been
+  tested.
+- A runtime compatibility gate
+  (`numba_metal.compat.check_numba_compatible`, invoked by
+  `metal.jit`/`metal.get_device_info()` via `check_capable()`) raises a
+  specific `UnsupportedNumbaVersionError` if the installed Numba version
+  is outside the validated `0.67.x` series, rather than relying solely
+  on the packaging dependency bound being enforced (which it might not
+  be, e.g. under `pip install --no-deps` or an in-place Numba upgrade).
+  This converts "might silently produce wrong MSL from a changed
+  internal-IR shape" into "fails immediately with a specific,
+  actionable error" -- it does not make an untested version work, only
+  makes the failure mode safe. See `docs/numba-rfc.md` for the full
+  compatibility table and the internal APIs this depends on.
 
 ## What has and hasn't been verified
 

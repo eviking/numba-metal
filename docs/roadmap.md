@@ -5,20 +5,30 @@ dependency, principal risk, and rough complexity (small/medium/large).
 
 ## Phase 1: Harden the MVP
 
-**Broader correctness testing**
-User value: confidence beyond the current test suite's coverage.
+**Broader correctness testing** -- largely done in the post-MVP
+hardening pass (see `CHANGELOG.md`): a Hypothesis-based differential
+test suite (`tests/differential/`, 500/500 exhaustive cases passing),
+integer overflow/wraparound and float32 boundary-value coverage
+(`tests/integration/test_boundary_values.py`), and a feature-matrix
+traceability audit closing every "Supported"-but-under-tested gap
+(`docs/feature-traceability.md`). Remaining: this is a floor, not a
+ceiling -- more generated-kernel grammar coverage (device functions once
+supported, more dtype combinations) remains valuable as the supported
+subset grows.
 Dependency: none; extends `tests/`.
 Risk: low.
-Complexity: medium (more kernels, more edge cases, especially around
-integer overflow/wraparound behavior and float32 boundary conditions not
-yet exercised).
+Complexity: small-medium, incrementally, going forward.
 
 **Stable Numba-version adapters**
 User value: reduces breakage when users upgrade Numba.
 Dependency: testing against multiple Numba versions in the declared
-range (currently only 0.67.0 has been exercised -- see
-`docs/limitations.md`); possibly a small per-version shim layer in
-`numba_metal/compiler/frontend.py` if internal APIs shift.
+range. Still only 0.67.0 has been exercised against the full test
+suite; a runtime compatibility gate now exists
+(`numba_metal.compat.check_numba_compatible`) that fails explicitly
+rather than silently on any other version, but expanding the actually-
+*validated* range still requires running the test suite against each
+new candidate version -- that has not happened yet for anything past
+0.67.0.
 Risk: medium -- `numba.core.typed_passes`/`compiler_machinery` have no
 stability guarantee, so this is ongoing maintenance, not a one-time fix.
 Complexity: medium.
@@ -44,13 +54,18 @@ Risk: low-medium (cache invalidation bugs are the classic failure mode;
 must be conservative about what counts as "the same kernel").
 Complexity: medium.
 
-**Automated Apple-silicon testing (CI)**
+**Automated Apple-silicon testing (CI)** -- partially done: a Python
+3.12/3.13 matrix now runs lint, format check, and non-GPU unit tests on
+every push/PR (`.github/workflows/ci.yml`). The GPU-requiring job
+(`gpu-tests`, `pytest -m metal` + a quick benchmark run) is written and
+matrixed the same way but still gated `if: false`, since it requires a
+self-hosted Apple-silicon runner that has not been provisioned.
 User value: confidence that changes don't silently break GPU execution.
 Dependency: access to Apple-silicon CI runners (GitHub Actions macOS
 arm64 runners, or self-hosted).
 Risk: low; mainly a resourcing/cost question, not technical.
-Complexity: small-medium (workflow config; the test suite already
-separates GPU-requiring tests via `pytest -m metal`).
+Complexity: small (flip `if: false` once a runner is provisioned; the
+workflow itself is already written).
 
 **Performance profiling**
 User value: understand where time actually goes (compile vs. dispatch vs.
@@ -268,16 +283,20 @@ manifest" tool.
 Risk: low.
 Complexity: medium.
 
-**Coordination with Numba maintainers**
+**Coordination with Numba maintainers** -- findings written up, not yet
+posted: `docs/numba-rfc.md` (paste-ready comment for numba/numba#5706,
+informed by actually reading that issue's multi-year discussion
+thread) and `docs/upstream-strategy.md` (assesses four paths and
+recommends staying external while raising the "frontend-only extension
+point" question). Posting the RFC comment itself is the remaining step.
 User value: reduces the compatibility-risk items in
 `docs/limitations.md` by getting numba-metal's needs (a stable "typed IR
 only, no lowering" entry point) considered in Numba's own roadmap.
-Dependency: none technical; a relationship/communication effort, likely
-starting from numba/numba#5706 (the open Metal-backend feature request
-this task's instructions named -- not actually reviewed during this
-project's implementation; see `docs/implementation-plan.md`).
+Dependency: none technical; a relationship/communication effort.
 Risk: low technical risk, but outcome-uncertain (maintainer bandwidth
-and priorities are outside this project's control).
+and priorities are outside this project's control; the issue's own
+history shows maintainers have consistently said a full Metal target is
+unlikely without a contributor driving it).
 Complexity: small (from numba-metal's side; the uncertainty is on the
 other side of the conversation).
 

@@ -65,16 +65,38 @@ source.
 ## Numba-version mismatch
 
 ```
+UnsupportedNumbaVersionError: numba-metal has only been validated against Numba ['0.67.0']; found Numba '...' installed. ...
+```
+
+This is the expected, deliberate failure mode for an unvalidated Numba
+version: `numba_metal.compat.check_numba_compatible()` (invoked by
+`metal.jit`/`metal.get_device_info()` via `check_capable()`) checks
+`numba.__version__` before any kernel is compiled, and raises this
+explicitly rather than letting an untested version silently produce
+wrong MSL from a changed internal-IR shape. Install a supported version:
+
+```bash
+pip install 'numba>=0.67,<0.68'
+```
+
+If you've independently validated numba-metal's test suite against a
+different Numba version, see `docs/numba-rfc.md` for how to extend the
+compatibility gate.
+
+```
 KernelCompilationError: Internal error: numba-metal's typed-IR-only compiler pipeline did not produce a TypedKernelIR ...
 ```
 
-This means the installed Numba version changed its compiler-pipeline
-internals (`CompilerBase`, `compiler_machinery`, or `typed_passes`) in a
-way numba-metal's frontend adapter (`numba_metal/compiler/frontend.py`)
-doesn't yet handle -- see `docs/limitations.md` for why this class of
-breakage is possible. Check `numba.__version__` against the range pinned
-in `pyproject.toml`; if you're outside it, install a Numba version within
-the tested range. If you're inside the declared range and still see this,
+This is a different, rarer symptom of the same underlying risk: it can
+occur if the compatibility gate above accepted an untested *patch*
+release within the `0.67.x` series (patch releases are allowed through
+without an exact-version match -- see `docs/numba-rfc.md`) that turned
+out to still change compiler-pipeline internals (`CompilerBase`,
+`compiler_machinery`, or `typed_passes`) in a way numba-metal's frontend
+adapter (`numba_metal/compiler/frontend.py`) doesn't handle. Check
+`numba.__version__`; if it's not exactly `0.67.0` (the only version this
+project's test suite has actually been run against), try pinning to
+`0.67.0` exactly. If you're already on `0.67.0` and still see this,
 please file an issue with your exact Numba version.
 
 ## Unsupported dtype

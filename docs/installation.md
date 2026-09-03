@@ -10,8 +10,8 @@ are exact, not illustrative.
 |---|---|
 | macOS | 14 or newer |
 | Architecture | Apple silicon (arm64) only -- Intel Macs are rejected at runtime |
-| Python | 3.10 - 3.13 |
-| Numba | 0.59 - 0.67 (pinned bound in `pyproject.toml`; only 0.67.0 has been exercised so far) |
+| Python | 3.12 - 3.13 (full test suite run and passing on both; `requires-python` in `pyproject.toml`) |
+| Numba | 0.67.x (pinned bound in `pyproject.toml`; only 0.67.0 has actually been run against the full test suite -- see `numba_metal.compat` for the runtime version check that enforces this at import/first-use time, and `docs/numba-rfc.md` for the compatibility table) |
 | NumPy | 1.24 - 2.x |
 
 ## 1. Verify you're on Apple silicon
@@ -168,6 +168,14 @@ You're on an Intel Mac, or running under Rosetta translation. Check
 `uname -m`; if it prints `x86_64` under what you believe is an
 Apple-silicon Mac, you may be in a Rosetta-translated terminal/shell --
 relaunch your terminal natively.
+
+**`UnsupportedNumbaVersionError: numba-metal has only been validated
+against Numba [...]`**
+Your installed Numba version is outside the validated `0.67.x` series.
+This is raised deliberately and explicitly (see
+`numba_metal.compat.check_numba_compatible`) rather than letting an
+untested version silently produce wrong MSL from a changed internal-IR
+shape. Install a supported version (`pip install 'numba>=0.67,<0.68'`).
 
 **Numba version mismatch / `KernelCompilationError` mentioning "did not
 produce a TypedKernelIR"**
