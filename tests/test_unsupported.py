@@ -133,7 +133,7 @@ def test_grid_with_non_literal_ndim_rejected() -> None:
 
 def test_grid_with_unsupported_ndim_rejected() -> None:
     def f(a, out):
-        x, y, z = metal.grid(3)
+        w = metal.grid(4)
         out[0] = a[0]
 
     with pytest.raises((UnsupportedFeatureError, KernelCompilationError)):

@@ -71,18 +71,18 @@ def _infer_arg_type(value) -> nb_types.Type:
     )
 
 
-_LaunchDim = int | tuple[int, int]
+_LaunchDim = int | tuple[int, int] | tuple[int, int, int]
 
 
 class _LaunchConfigured:
     """Bound to a launch geometry via `kernel[blocks, threads]`; calling
     it with kernel arguments compiles (if needed) and dispatches.
 
-    `blocks`/`threads` are each either a plain int (1D launch; the kernel
-    typically calls `metal.grid(1)`) or a `(x, y)` int tuple (2D launch;
-    the kernel typically calls `metal.grid(2)`) -- mirroring CUDA-style
-    `kernel[blocks, threads]` syntax extended to 2D per the task's
-    "1D or 2D grids" requirement.
+    `blocks`/`threads` are each a plain int (1D launch; the kernel
+    typically calls `metal.grid(1)`), a `(x, y)` int tuple (2D launch;
+    `metal.grid(2)`), or a `(x, y, z)` int tuple (3D launch;
+    `metal.grid(3)`) -- mirroring CUDA-style `kernel[blocks, threads]`
+    syntax extended to 1D/2D/3D.
     """
 
     __slots__ = ("_dispatcher", "_blocks", "_threads")
@@ -117,14 +117,16 @@ class KernelDispatcher:
         return _LaunchConfigured(self, blocks, threads)
 
     def _launch(self, blocks: _LaunchDim, threads: _LaunchDim, args: tuple) -> None:
-        bx, by = blocks if isinstance(blocks, tuple) else (blocks, 1)
-        tx, ty = threads if isinstance(threads, tuple) else (threads, 1)
+        bx, by, bz = _as_3tuple(blocks)
+        tx, ty, tz = _as_3tuple(threads)
 
         for label, val in (
             ("block count", bx),
             ("block count", by),
+            ("block count", bz),
             ("threads-per-block", tx),
             ("threads-per-block", ty),
+            ("threads-per-block", tz),
         ):
             if val <= 0:
                 raise KernelLaunchError(
@@ -132,12 +134,12 @@ class KernelDispatcher:
                     f"positive, got {val}."
                 )
         ctx = get_context()
-        total_tg_threads = tx * ty
+        total_tg_threads = tx * ty * tz
         if total_tg_threads > ctx.info.max_threads_per_threadgroup:
             raise KernelLaunchError(
                 f"Invalid launch configuration: threads-per-block "
-                f"({tx}x{ty}={total_tg_threads}) exceeds this device's "
-                f"maximum ({ctx.info.max_threads_per_threadgroup})."
+                f"({tx}x{ty}x{tz}={total_tg_threads}) exceeds this "
+                f"device's maximum ({ctx.info.max_threads_per_threadgroup})."
             )
 
         arg_types = tuple(_infer_arg_type(a) for a in args)
@@ -150,10 +152,18 @@ class KernelDispatcher:
                 f"{len(args)}."
             )
 
-        self._dispatch(compiled, bx, by, tx, ty, args)
+        self._dispatch(compiled, bx, by, bz, tx, ty, tz, args)
 
     def _dispatch(
-        self, compiled: CompiledKernel, bx: int, by: int, tx: int, ty: int, args: tuple
+        self,
+        compiled: CompiledKernel,
+        bx: int,
+        by: int,
+        bz: int,
+        tx: int,
+        ty: int,
+        tz: int,
+        args: tuple,
     ) -> None:
         import Metal
 
@@ -196,14 +206,31 @@ class KernelDispatcher:
                 encoder.setBuffer_offset_atIndex_(scalar_buf, 0, buffer_index)
                 buffer_index += 1
 
-        grid_x, grid_y = bx * tx, by * ty
-        grid_size = Metal.MTLSizeMake(grid_x, grid_y, 1)
-        # Metal requires threadsPerThreadgroup's product not exceed the
-        # pipeline's maxTotalThreadsPerThreadgroup; scale down y first if
-        # needed since numba-metal's supported kernels are typically x-major.
-        tg_x = min(tx, compiled.max_threads_per_threadgroup)
-        tg_y = max(1, min(ty, compiled.max_threads_per_threadgroup // max(tg_x, 1)))
-        tg_size = Metal.MTLSizeMake(tg_x, tg_y, 1)
+        # Every `metal.shared_array()` declared in this kernel must have
+        # its backing threadgroup memory explicitly allocated via
+        # setThreadgroupMemoryLength:atIndex:, with `atIndex` matching
+        # the `[[threadgroup(n)]]` attribute index the MSL backend
+        # assigned it (see MSLKernelLowerer._emit_signature). Metal does
+        # NOT allocate this automatically from the `threadgroup <type>
+        # name[count]` parameter declaration alone -- omitting this call
+        # silently leaves the memory unallocated, which was observed
+        # directly while implementing this feature: every thread's read
+        # of its own just-written value came back as 0, with no error
+        # from Metal at compile, encode, or execution time.
+        for tg_index, tg in enumerate(compiled.signature.threadgroup_arrays):
+            encoder.setThreadgroupMemoryLength_atIndex_(tg.byte_size, tg_index)
+
+        grid_x, grid_y, grid_z = bx * tx, by * ty, bz * tz
+        grid_size = Metal.MTLSizeMake(grid_x, grid_y, grid_z)
+        # The threadgroup size dispatched is EXACTLY (tx, ty, tz) as
+        # requested by the caller -- `_launch` already validated
+        # tx*ty*tz <= max_threads_per_threadgroup before reaching here, so
+        # there is no need (and it would be actively wrong) to silently
+        # rescale any dimension: a kernel that calls
+        # metal.threads_per_threadgroup()/metal.thread_in_threadgroup()
+        # must see the threadgroup size it was actually launched with, not
+        # one numba-metal quietly substituted.
+        tg_size = Metal.MTLSizeMake(tx, ty, tz)
         encoder.dispatchThreads_threadsPerThreadgroup_(grid_size, tg_size)
         encoder.endEncoding()
         cmdbuf.commit()
@@ -237,14 +264,26 @@ def _parse_launch_dim(value, label: str) -> _LaunchDim:
         return value
     if (
         isinstance(value, tuple)
-        and len(value) == 2
+        and len(value) in (2, 3)
         and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
     ):
         return value
     raise KernelLaunchError(
-        f"Launch configuration {label} must be an int (1D) or a 2-tuple "
-        f"of int (2D); got {value!r}."
+        f"Launch configuration {label} must be an int (1D), a 2-tuple of "
+        f"int (2D), or a 3-tuple of int (3D); got {value!r}."
     )
+
+
+def _launch_dim_ndim(value: _LaunchDim) -> int:
+    return 1 if isinstance(value, int) else len(value)
+
+
+def _as_3tuple(value: _LaunchDim) -> tuple[int, int, int]:
+    if isinstance(value, int):
+        return value, 1, 1
+    if len(value) == 2:
+        return value[0], value[1], 1
+    return value[0], value[1], value[2]
 
 
 def _parse_launch_config(launch_config) -> tuple[_LaunchDim, _LaunchDim]:
@@ -256,10 +295,12 @@ def _parse_launch_config(launch_config) -> tuple[_LaunchDim, _LaunchDim]:
     blocks, threads = launch_config
     blocks = _parse_launch_dim(blocks, "blocks")
     threads = _parse_launch_dim(threads, "threads")
-    if isinstance(blocks, tuple) != isinstance(threads, tuple):
+    if _launch_dim_ndim(blocks) != _launch_dim_ndim(threads):
         raise KernelLaunchError(
-            "Launch configuration blocks and threads must both be 1D (int) "
-            f"or both be 2D (tuple); got blocks={blocks!r}, threads={threads!r}."
+            "Launch configuration blocks and threads must have the same "
+            f"number of dimensions; got blocks={blocks!r} "
+            f"({_launch_dim_ndim(blocks)}D), threads={threads!r} "
+            f"({_launch_dim_ndim(threads)}D)."
         )
     return blocks, threads
 

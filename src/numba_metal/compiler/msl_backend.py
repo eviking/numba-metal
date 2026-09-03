@@ -103,6 +103,15 @@ class KernelSignatureInfo:
     array_params: list[ArrayParamInfo] = field(default_factory=list)
     scalar_params: list[tuple[str, nb_types.Type]] = field(default_factory=list)
     param_order: list[tuple[str, str]] = field(default_factory=list)
+    # `metal.shared_array()` declarations, in the exact order their
+    # `[[threadgroup(n)]]` attribute index was assigned in
+    # `_emit_signature` -- the dispatcher must call
+    # `setThreadgroupMemoryLength:atIndex:` for each one (with `n` equal
+    # to its position in this list) before every dispatch, or the
+    # threadgroup memory the kernel reads/writes is simply unallocated
+    # (silently reads/writes as zero, with no error from Metal -- found
+    # by direct testing while implementing this feature).
+    threadgroup_arrays: list[_ThreadgroupArrayInfo] = field(default_factory=list)
 
 
 def nb_scalar_dtype_to_numpy(ty: nb_types.Type) -> np.dtype:
@@ -136,6 +145,35 @@ class _RangeCallInfo:
     start: str
     stop: str
     step: str
+
+
+@dataclass
+class _LocalArrayInfo:
+    """A `metal.local_array(shape, dtype)` call site: declared as an
+    ordinary MSL function-body array, private to the calling thread."""
+
+    target_name: str
+    ident: str
+    msl_elem_ty: str
+    count: int
+
+
+@dataclass
+class _ThreadgroupArrayInfo:
+    """A `metal.shared_array(shape, dtype)` call site: declared as a
+    `threadgroup`-qualified kernel-function parameter (MSL does not
+    permit `threadgroup`-qualified locals inside a function body), shared
+    by every thread in the same threadgroup."""
+
+    target_name: str
+    ident: str
+    msl_elem_ty: str
+    count: int
+    elem_itemsize: int
+
+    @property
+    def byte_size(self) -> int:
+        return self.count * self.elem_itemsize
 
 
 class _ForRangeLoopInfo:
@@ -225,6 +263,24 @@ class MSLKernelLowerer:
         # that a kernel with multiple/nested for-range loops gets a
         # distinct, non-colliding set of MSL identifiers for each one.
         self._range_snapshot_counter = 0
+        # Threadgroup ("shared") memory declarations collected from
+        # metal.shared_array() calls found while pre-scanning the kernel
+        # body (see _collect_special_arrays); emitted as
+        # `threadgroup <type> <ident>[<count>]` kernel-function parameters
+        # (MSL's convention for threadgroup-address-space arrays -- they
+        # cannot be declared as ordinary function-body locals).
+        self._threadgroup_arrays: list[_ThreadgroupArrayInfo] = []
+        # metal.local_array() call sites, keyed by SSA target name; each
+        # gets its own ordinary MSL function-body array declaration (see
+        # _declare_locals) instead of going through the generic
+        # scalar/tuple _msl_type_for path.
+        self._local_arrays: dict[str, _LocalArrayInfo] = {}
+        # SSA target names of metal.shared_array() calls, keyed the same
+        # way as _local_arrays but resolved via self._threadgroup_arrays
+        # (declared once, as a kernel parameter -- see above -- not
+        # per-occurrence).
+        self._threadgroup_array_targets: dict[str, _ThreadgroupArrayInfo] = {}
+        self._special_array_counter = 0
 
     def lower(self) -> str:
         """Run the full typed-IR-to-MSL lowering and return the generated
@@ -232,6 +288,7 @@ class MSLKernelLowerer:
         prelude, added by the caller)."""
         self._classify_params()
         self._collect_globals()
+        self._collect_special_arrays()
         self._collect_range_calls()
         entry = min(self.func_ir.blocks.keys())
         structured = structure_function(self.func_ir.blocks, entry)
@@ -290,6 +347,29 @@ class MSLKernelLowerer:
                 buffer_index += 1
         params.append("uint3 numba_metal_tid [[thread_position_in_grid]]")
         params.append("uint3 numba_metal_grid_size [[threads_per_grid]]")
+        params.append("uint3 numba_metal_tgid [[threadgroup_position_in_grid]]")
+        params.append("uint3 numba_metal_tid_in_tg [[thread_position_in_threadgroup]]")
+        params.append("uint3 numba_metal_tg_size [[threads_per_threadgroup]]")
+        if self._threadgroup_arrays:
+            for tg_index, tg in enumerate(self._threadgroup_arrays):
+                # MSL requires a `[[threadgroup(n)]]`-attributed
+                # parameter to be a pointer, not a fixed-size array type
+                # (confirmed directly against Apple's Metal compiler:
+                # `threadgroup float name[8] [[threadgroup(0)]]` is
+                # rejected with "'threadgroup' attribute cannot be
+                # applied to types"; `threadgroup float* name
+                # [[threadgroup(0)]]` compiles). The actual backing size
+                # is supplied at dispatch time via
+                # `setThreadgroupMemoryLength:atIndex:` (see
+                # runtime/dispatcher.py), matching this parameter's index
+                # -- `tg.count` is enforced only by `[]` indexing being
+                # the sole way generated code ever touches this pointer,
+                # never by the MSL type itself.
+                params.append(
+                    f"threadgroup {tg.msl_elem_ty}* {tg.ident} "
+                    f"[[threadgroup({tg_index})]]"
+                )
+                self.sig.threadgroup_arrays.append(tg)
         joined = ",\n    ".join(params)
         self.builder.write(f"kernel void {self.kernel_name}(")
         self.builder.write(f"    {joined})")
@@ -297,10 +377,21 @@ class MSLKernelLowerer:
 
     # -- local declarations -----------------------------------------------
 
-    @staticmethod
-    def _ident(var_name: str) -> str:
+    def _ident(self, var_name: str) -> str:
         """MSL identifier for a given SSA variable name. Every distinct
-        SSA name maps to its own distinct identifier -- no aliasing."""
+        SSA name maps to its own distinct identifier -- no aliasing.
+
+        `metal.local_array()`/`metal.shared_array()` call targets are
+        special-cased to their pre-assigned array identifier (see
+        `_collect_special_arrays`) rather than the default `v_<name>`
+        scheme, since a threadgroup array's identifier must match the
+        one already emitted as a kernel-function parameter in
+        `_emit_signature`.
+        """
+        if var_name in self._local_arrays:
+            return self._local_arrays[var_name].ident
+        if var_name in self._threadgroup_array_targets:
+            return self._threadgroup_array_targets[var_name].ident
         safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in var_name)
         return "v_" + safe
 
@@ -329,11 +420,31 @@ class MSLKernelLowerer:
                 continue
             if name in self._suppressed_names:
                 continue
+            if name in self._threadgroup_array_targets:
+                # Already declared as a `threadgroup`-qualified
+                # kernel-function parameter in _emit_signature; MSL does
+                # not permit a second, ordinary function-body declaration
+                # for the same identifier.
+                continue
+            if name in self._local_arrays:
+                info = self._local_arrays[name]
+                self.builder.write(f"{info.msl_elem_ty} {info.ident}[{info.count}];")
+                continue
             if isinstance(ty, (nb_types.Omitted, nb_types.NoneType)):
                 continue
             if isinstance(
-                ty, (nb_types.FunctionType, nb_types.Function, nb_types.RangeType)
+                ty,
+                (
+                    nb_types.FunctionType,
+                    nb_types.Function,
+                    nb_types.RangeType,
+                    nb_types.NumberClass,
+                ),
             ):
+                # NumberClass is the type of a dtype *reference* itself
+                # (e.g. the `np.float32` argument passed to
+                # metal.local_array()/shared_array()) -- a compile-time
+                # value with no MSL representation, never read as data.
                 continue
             if isinstance(ty, nb_types.RangeIteratorType):
                 continue
@@ -399,9 +510,12 @@ class MSLKernelLowerer:
         if isinstance(ty, nb_types.UniTuple) and ty.dtype == nb_types.int64:
             if ty.count == 2:
                 return "long2"
+            if ty.count == 3:
+                return "long3"
             raise UnsupportedFeatureError(
-                f"Unsupported tuple type {ty!r}: only 2-tuples of int64 "
-                "(from metal.grid(2)) are supported."
+                f"Unsupported tuple type {ty!r}: only 2-tuples or 3-tuples "
+                "of int64 (from metal.grid(2)/metal.grid(3) and the other "
+                "thread/threadgroup-position intrinsics) are supported."
             )
         if isinstance(ty, nb_types.Pair):
             return None  # iternext pair results never materialize in MSL
@@ -424,7 +538,11 @@ class MSLKernelLowerer:
             return numba_scalar_to_msl(ty)
         if isinstance(ty, nb_types.Array):
             raise UnsupportedFeatureError(
-                "Local array variables are not supported inside kernels."
+                "Array-typed local variables are only supported when "
+                "produced by metal.local_array(shape, dtype) or "
+                "metal.shared_array(shape, dtype); general array-typed "
+                "expressions (e.g. slicing) are not supported inside "
+                "kernels."
             )
         raise UnsupportedFeatureError(
             f"Unsupported local variable type {ty!r}; no MSL representation."
@@ -452,6 +570,66 @@ class MSLKernelLowerer:
 
     def _resolve_global(self, var_name: str):
         return self._globals.get(var_name)
+
+    def _collect_special_arrays(self) -> None:
+        """Pre-scan every `metal.local_array(...)`/`metal.shared_array(...)`
+        call site (requires `self._globals` already populated by
+        `_collect_globals`) and record shape/dtype/identifier info for
+        each. Threadgroup arrays are additionally appended to
+        `self._threadgroup_arrays` here, since `_emit_signature` (which
+        declares them as kernel-function parameters) runs before any
+        statement is walked."""
+        for block in self.func_ir.blocks.values():
+            for stmt in block.body:
+                if not (
+                    isinstance(stmt, ir.Assign)
+                    and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == "call"
+                ):
+                    continue
+                callee = self._resolve_global(stmt.value.func.name)
+                if callee is not intrinsics.local_array and (
+                    callee is not intrinsics.shared_array
+                ):
+                    continue
+                target_name = stmt.target.name
+                shape_var, dtype_var = stmt.value.args[0], stmt.value.args[1]
+                shape_ty = self.typemap.get(shape_var.name)
+                if not isinstance(shape_ty, nb_types.IntegerLiteral):
+                    raise UnsupportedFeatureError(
+                        "metal.local_array()/shared_array() require a "
+                        "literal integer shape known at compile time."
+                    )
+                count = shape_ty.literal_value
+                dtype_ty = self.typemap.get(dtype_var.name)
+                elem_ty = getattr(dtype_ty, "instance_type", None)
+                if elem_ty is None:
+                    raise UnsupportedFeatureError(
+                        "metal.local_array()/shared_array() require a "
+                        "NumPy scalar dtype (e.g. np.float32) as the "
+                        "second argument."
+                    )
+                msl_elem_ty = numba_scalar_to_msl(elem_ty)
+                ident = f"v_special_arr_{self._special_array_counter}"
+                self._special_array_counter += 1
+                if callee is intrinsics.local_array:
+                    self._local_arrays[target_name] = _LocalArrayInfo(
+                        target_name=target_name,
+                        ident=ident,
+                        msl_elem_ty=msl_elem_ty,
+                        count=count,
+                    )
+                else:
+                    elem_itemsize = nb_scalar_dtype_to_numpy(elem_ty).itemsize
+                    info = _ThreadgroupArrayInfo(
+                        target_name=target_name,
+                        ident=ident,
+                        msl_elem_ty=msl_elem_ty,
+                        count=count,
+                        elem_itemsize=elem_itemsize,
+                    )
+                    self._threadgroup_arrays.append(info)
+                    self._threadgroup_array_targets[target_name] = info
 
     def _collect_range_calls(self) -> None:
         """Pre-scan (before any MSL emission) every `range(...)` call site
@@ -890,6 +1068,7 @@ class MSLKernelLowerer:
                 nb_types.RangeType,
                 nb_types.Pair,
                 nb_types.RangeIteratorType,
+                nb_types.NumberClass,
             ),
         ):
             # No MSL declaration exists for these types (see
@@ -966,7 +1145,9 @@ class MSLKernelLowerer:
         elif op == "build_tuple":
             raise UnsupportedFeatureError(
                 "Tuple construction is only supported as the direct result "
-                "of metal.grid(2); general tuple literals are unsupported."
+                "of a thread/threadgroup-position intrinsic called with "
+                "ndim=2 or ndim=3 (e.g. metal.grid(2)); general tuple "
+                "literals are unsupported."
             )
         else:
             raise UnsupportedFeatureError(f"Unsupported IR expression op {op!r}.")
@@ -1041,11 +1222,34 @@ class MSLKernelLowerer:
         if callee is bool:
             self._assign(target_name, args[0])
             return
-        if callee is intrinsics.grid or callee is intrinsics.gridsize:
+        if callee in (
+            intrinsics.grid,
+            intrinsics.gridsize,
+            intrinsics.threadgroup_position,
+            intrinsics.thread_in_threadgroup,
+            intrinsics.threads_per_threadgroup,
+        ):
             self._assign(target_name, self._grid_expr(callee, expr))
             return
         if callee is range:
             self._range_calls[target_name] = args
+            return
+        if callee is intrinsics.local_array or callee is intrinsics.shared_array:
+            # The target's array declaration was already emitted in
+            # _declare_locals (an ordinary function-body array for
+            # local_array, a threadgroup-qualified kernel parameter for
+            # shared_array) -- MSL has no single-expression array
+            # initializer syntax to assign here, so this call site emits
+            # nothing further.
+            return
+        if callee is intrinsics.barrier:
+            # Not routed through _assign: the call's SSA target is
+            # None-typed (a bare `metal.barrier()` statement's result is
+            # discarded), and _assign deliberately drops None-typed
+            # targets (see its docstring) -- this is a statement with a
+            # real side effect, not a value-producing expression, so it
+            # must be written unconditionally.
+            self.builder.write("threadgroup_barrier(mem_flags::mem_threadgroup);")
             return
         if callee is abs:
             self._assign(target_name, f"abs({args[0]})")
@@ -1097,26 +1301,44 @@ class MSLKernelLowerer:
             f"Unsupported function call to {callee!r} in kernel."
         )
 
+    #: Maps each thread/threadgroup-position intrinsic to the MSL
+    #: parameter identifier carrying the corresponding
+    #: `[[attribute]]`-qualified uint3 value (declared in
+    #: `_emit_signature`). All four share one lowering shape: read the
+    #: literal ndim, then build a scalar/2-tuple/3-tuple long expression
+    #: from that uint3's `.x`/`.y`/`.z` fields.
+    _POSITION_INTRINSIC_SOURCE = {
+        "grid": "numba_metal_tid",
+        "gridsize": "numba_metal_grid_size",
+        "threadgroup_position": "numba_metal_tgid",
+        "thread_in_threadgroup": "numba_metal_tid_in_tg",
+        "threads_per_threadgroup": "numba_metal_tg_size",
+    }
+
     def _grid_expr(self, callee, expr: ir.Expr) -> str:
         ndim_var = expr.args[0]
         ndim_ty = self.typemap.get(ndim_var.name)
         if not isinstance(ndim_ty, nb_types.IntegerLiteral):
             raise UnsupportedFeatureError(
-                "metal.grid()/gridsize() require a literal integer ndim "
-                "argument known at compile time."
+                "metal thread/threadgroup-position intrinsics require a "
+                "literal integer ndim argument known at compile time."
             )
         ndim = ndim_ty.literal_value
-        source = (
-            "numba_metal_grid_size"
-            if callee is intrinsics.gridsize
-            else "numba_metal_tid"
-        )
+        intrinsic_name = getattr(callee, "__name__", None)
+        source = self._POSITION_INTRINSIC_SOURCE.get(intrinsic_name)
+        if source is None:  # pragma: no cover - defensive, unreachable via _call
+            raise UnsupportedFeatureError(
+                f"Unknown thread-position intrinsic {callee!r}."
+            )
         if ndim == 1:
             return f"long({source}.x)"
         if ndim == 2:
             return f"long2(long({source}.x), long({source}.y))"
+        if ndim == 3:
+            return f"long3(long({source}.x), long({source}.y), long({source}.z))"
         raise UnsupportedFeatureError(
-            f"metal.grid(ndim)/gridsize(ndim) only support ndim in (1, 2); got {ndim}."
+            f"metal thread/threadgroup-position intrinsics only support "
+            f"ndim in (1, 2, 3); got {ndim}."
         )
 
     def _read(self, var: ir.Var) -> str:

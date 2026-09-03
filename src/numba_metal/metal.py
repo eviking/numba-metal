@@ -12,7 +12,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from numba_metal.compiler.intrinsics import grid, gridsize  # noqa: F401 (re-exported)
+from numba_metal.compiler.intrinsics import (  # noqa: F401 (re-exported)
+    barrier,
+    grid,
+    gridsize,
+    local_array,
+    shared_array,
+    thread_in_threadgroup,
+    threadgroup_position,
+    threads_per_threadgroup,
+)
 from numba_metal.runtime.array import (
     DeviceNDArray,
     device_array,
@@ -27,6 +36,12 @@ __all__ = [
     "jit",
     "grid",
     "gridsize",
+    "threadgroup_position",
+    "thread_in_threadgroup",
+    "threads_per_threadgroup",
+    "local_array",
+    "shared_array",
+    "barrier",
     "to_device",
     "device_array",
     "device_array_like",
