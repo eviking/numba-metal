@@ -209,6 +209,134 @@ block-scoped), from the typemap -- this mirrors how Numba's own SSA form
 already treats every `Var` as function-scoped, and sidesteps MSL's
 declare-before-use requirement without needing separate scope tracking.
 
+### 3. Thread/threadgroup indexing, local/shared memory, barriers, atomics
+
+These are all implemented as `numba.extending.intrinsic`-typed functions
+in `numba_metal/compiler/intrinsics.py`, following exactly the same
+split as `metal.grid()`/`metal.gridsize()` (real Numba typing, never-run
+LLVM codegen, pattern-matched and lowered directly to MSL by
+`msl_backend.py`'s `_call`):
+
+- **3D dispatch**: `metal.grid(3)`/`metal.gridsize(3)` extend the
+  existing 1D/2D support; `KernelDispatcher`'s launch syntax accepts
+  `kernel[(bx,by,bz), (tx,ty,tz)]`. Fixed a real, previously-latent bug
+  while adding this: the dispatcher used to silently rescale a 2D
+  threadgroup's y-dimension if `tx*ty` exceeded the device's
+  per-threadgroup thread limit (unreachable in practice, since launch
+  validation already rejects that combination first -- but actively
+  wrong now that a kernel can observe its own launch geometry via
+  `metal.threads_per_threadgroup()`). It now always dispatches exactly
+  the requested threadgroup shape.
+- **Threadgroup-relative indexing**: `metal.threadgroup_position(ndim)`,
+  `metal.thread_in_threadgroup(ndim)`, `metal.threads_per_threadgroup(ndim)`
+  map to MSL's `threadgroup_position_in_grid`,
+  `thread_position_in_threadgroup`, `threads_per_threadgroup` attributes,
+  declared as additional kernel-function parameters alongside the
+  existing `thread_position_in_grid`/`threads_per_grid`.
+- **`metal.local_array(shape, dtype)`**: an ordinary MSL function-body
+  array, one instance per GPU thread. `shape` must be a compile-time
+  integer literal (MSL requires a fixed array size); `dtype` a NumPy
+  scalar type object, restricted to numba-metal's existing supported
+  array-element dtypes.
+- **`metal.shared_array(shape, dtype)`**: a `threadgroup`-qualified
+  array shared by every thread in a threadgroup. Two real issues were
+  found and fixed while implementing this, both confirmed directly
+  against Apple's actual Metal compiler/runtime rather than assumed:
+  1. MSL rejects a `[[threadgroup(n)]]`-attributed parameter declared as
+     a fixed-size array type ("'threadgroup' attribute cannot be applied
+     to types"); the correct form is a pointer,
+     `threadgroup <type>* name [[threadgroup(n)]]`.
+  2. Even with the correct pointer syntax, that memory is not
+     automatically allocated from the declaration alone -- the compute
+     encoder must call `setThreadgroupMemoryLength:atIndex:` (with
+     `atIndex` matching the parameter's `[[threadgroup(n)]]` index)
+     before every dispatch. Omitting this compiles and runs with **no
+     error at any stage**; every thread's read of memory it just wrote
+     silently comes back as zero. `KernelSignatureInfo.threadgroup_arrays`
+     carries each declaration's byte size (`count * dtype.itemsize`) from
+     the backend to `runtime/dispatcher.py`, which makes this call for
+     every `metal.shared_array()` the kernel declares, every launch.
+- **`metal.barrier()`**: `threadgroup_barrier(mem_flags::mem_threadgroup)`.
+- **Atomics**: `metal.atomic_add/sub/min/max/exchange(array, index,
+  value)` and `metal.atomic_compare_exchange(array, index, expected,
+  desired)` (returning `(old_value, success)`), for int32/uint32/float32
+  device-array elements. Lowered as an in-place pointer cast at the call
+  site -- `(device atomic_<T>*)(&array[index])` -- rather than requiring
+  a kernel argument to be declared with an atomic-qualified MSL type;
+  verified directly (both by compiling and by running under real
+  multi-hundred-thousand-thread contention) that this produces correct,
+  race-free atomics. float32 has **no native MSL atomic min/max on any
+  Apple GPU family** -- confirmed by direct compilation against Apple's
+  Metal compiler, which rejects `atomic_fetch_min_explicit`/
+  `atomic_fetch_max_explicit` for `atomic_float*` with "no matching
+  function," a permanent MSL-language limitation (int32/uint32 atomic
+  min/max are native). float32 min/max is instead lowered to a
+  compare-and-swap retry loop, verified race-free and exact under real
+  contention (`tests/integration/test_atomics.py`). The tuple result of
+  `atomic_compare_exchange` has no MSL representation as a value (MSL
+  has no tuple type); it is lowered to two independent MSL locals per
+  call site, tracked through Numba's `exhaust_iter`/`static_getitem`
+  tuple-unpacking IR shape via `MSLKernelLowerer._atomic_cas_results`
+  (a dict from SSA name to the two underlying MSL identifiers, so that
+  `old, ok = metal.atomic_compare_exchange(...)`'s two `static_getitem`
+  reads resolve to the right locals instead of attempting array-style
+  `[0]`/`[1]` indexing into a nonexistent tuple value).
+
+### 4. `while` loops: correct straight-line support, and where it stops
+
+Numba's bytecode lowering rotates `while cond: body` into a CFG distinct
+from `for x in range(...)`'s shape: rather than a header that only tests
+the condition, the loop header's own block typically contains one full
+iteration's real work followed by the *next* condition test, with the
+back-edge-target "body" block often trivial (an empty statement list
+plus an unconditional jump). `LoopNode.pre_test` (in `structuring.py`)
+captures the header's statements explicitly so `_emit_loop` (in
+`msl_backend.py`) can re-run them once per iteration; the loop itself is
+emitted as a real MSL `do { ... } while (cond);`, guarded by an outer
+`if` so a `do-while`'s "always execute at least once" semantics don't
+run one unwanted extra pass beyond what the pre-loop wrapper (which
+already executed the header once, including its exit-condition
+computation) already determined.
+
+Three genuinely wrong, silently-incorrect intermediate versions were
+found and fixed during development, each confirmed by direct testing
+before moving on (not merely by re-reading the code):
+
+1. Re-running `pre_test` *after* the trivial back-edge body block (whose
+   only statement is a literal `continue;`) meant `continue`'s real C
+   semantics -- jump to the loop's own test/re-entry point, skipping
+   everything else in the block -- skipped `pre_test` entirely, every
+   pass. A summation loop only ever added its first element.
+2. Re-running `pre_test` *before* checking the already-computed exit
+   condition, unconditionally, on every pass (including the first)
+   discarded that already-computed condition and forced one extra,
+   spurious re-run of the loop body before ever checking it. Caught via
+   a hand-rolled atomic-compare-exchange retry loop, where it
+   manifested as exactly one extra successful CAS beyond the correct
+   one-success-per-thread count under contention -- an off-by-one, not a
+   crash.
+3. Even after fixing the ordering to a genuine `do-while`, the
+   `do-while`'s own "always run the body at least once" semantics
+   produced the same off-by-one again, since the pre-loop wrapper's
+   already-computed first-pass result was never checked before entering
+   the `do-while` a second, unwanted time. Fixed with the outer `if`
+   guard described above.
+
+**Deliberately not fixed**: a `while` loop whose body contains a nested
+`if`/`else` with `break` or `continue` was found, by direct testing, to
+still mis-lower (confirmed: a continue-inside-if test and a
+break-inside-if test produced each other's expected results -- swapped,
+wrong control flow, not a crash). Generalizing the structurer to handle
+this is a substantially larger project than the primitives this
+architecture-hardening pass targeted (see `docs/roadmap.md`, "General
+`while` loops"). Rather than leave this as a silent hazard,
+`_reject_unsupported_while_body` walks the loop's structured body and
+raises `UnsupportedFeatureError` for any `IfNode`, or any
+`BreakNode`/`ContinueNode` beyond the one legitimate trivial-back-edge
+occurrence -- so only the verified-correct straight-line shape is ever
+compiled, and everything else fails loudly at compile time instead of
+silently miscompiling. See `tests/integration/test_while_loops.py`.
+
 ## Deliberate precision decisions
 
 - **float64 narrowing.** Python float literals and `/` true-division

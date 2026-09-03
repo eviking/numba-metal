@@ -78,34 +78,47 @@ Complexity: medium.
 
 ## Phase 2: Scientific-computing features
 
-**Reductions** (sum/min/max/argmax across a device array)
+**Reductions** (sum/min/max/argmax across a device array) -- the
+low-level primitives this depends on are now done (threadgroup memory,
+barriers, atomics; see below), but a dedicated multi-stage/tree
+reduction *helper* (as opposed to a hand-written single-threadgroup
+cooperative reduction, which `tests/integration/
+test_local_and_shared_memory.py` already demonstrates) is not yet
+built.
 User value: avoids the current pattern of downloading results and
 reducing on the CPU (as `monte_carlo_paths.py` does today, documented as
 a boundary in that benchmark).
-Dependency: threadgroup-memory support (below) for an efficient
-parallel-reduction implementation; a naive single-thread reduction kernel
-could ship first as a stepping stone.
+Dependency: threadgroup-memory support (done, see below).
 Risk: medium -- getting a correct, race-free parallel reduction in MSL
 right (threadgroup barriers, non-power-of-two sizes) is a real
 correctness hazard.
 Complexity: medium.
 
-**Shared/threadgroup memory**
-User value: unlocks tiled algorithms (matrix multiply, better stencils,
-efficient reductions/scans) that are memory-bandwidth-bound without it.
-Dependency: new MSL codegen for `threadgroup`-qualified local arrays and
-`threadgroup_barrier` calls; a new kernel-side API (something like
-`metal.shared_array(shape, dtype)`) with its own typing support.
-Risk: medium -- barrier placement/correctness is a common source of
-subtle bugs (races, deadlocks from divergent barrier calls).
-Complexity: large.
+**Shared/threadgroup memory** -- done. `metal.shared_array(shape,
+dtype)` (a `threadgroup`-qualified array, shared by every thread in a
+threadgroup) and `metal.barrier()` (`threadgroup_barrier`) are
+implemented and tested, including cross-thread visibility after a
+barrier and per-threadgroup isolation
+(`tests/integration/test_local_and_shared_memory.py`). A real MSL
+syntax/runtime-allocation issue was found and fixed along the way: a
+`[[threadgroup(n)]]`-attributed kernel parameter must be a pointer, not
+a fixed-size array type, and its backing memory must be explicitly
+sized per-dispatch via `setThreadgroupMemoryLength:atIndex:` --
+omitting either compiles/runs with no error and silently reads back as
+zero. `metal.local_array(shape, dtype)` (per-thread-private, not
+shared) is also implemented.
 
-**Atomics**
-User value: enables histogram/counting/scatter-reduce patterns.
-Dependency: MSL `atomic<T>` type support in the type-mapping layer and
-codegen for `atomic_fetch_add` etc.
-Risk: low-medium.
-Complexity: medium.
+**Atomics** -- done. `metal.atomic_add/sub/min/max/exchange` and
+`metal.atomic_compare_exchange` are implemented for int32/uint32/float32
+device-array elements, verified race-free under real multi-hundred-
+thousand-thread contention (`tests/integration/test_atomics.py`).
+float32 min/max has no native MSL atomic operation on any Apple GPU
+family (a permanent MSL-language limitation, not a device-capability
+gap -- verified directly against Apple's Metal compiler) and is lowered
+to a compare-and-swap retry loop instead. Building and testing this
+also surfaced and fixed two real, silent-wrong-result bugs in `while`
+-loop lowering (see the `while` loop entry in Phase 3 below) and one
+real MSL-syntax/runtime-allocation gap in threadgroup memory (above).
 
 **More dtypes** (int8/int16/uint8/uint16, verified uint64)
 User value: matches more real NumPy array dtypes without a manual cast.
@@ -122,8 +135,10 @@ against Metal's actual `metal_math` header.
 Risk: low.
 Complexity: small, incrementally.
 
-**Better multidimensional arrays** (native 2D/3D kernel arguments with
-real `.shape`, instead of requiring manual flattening)
+**Better multidimensional arrays** (native 2D/3D kernel ARGUMENTS with
+real `.shape`, instead of requiring manual flattening -- distinct from
+3D launch *grids*, which are done: `metal.grid(3)`/`kernel[(bx,by,bz),
+(tx,ty,tz)]` are implemented and tested)
 User value: removes the current requirement to flatten and hand-compute
 strides (as `heat_diffusion.py`/`pairwise_distance.py` do today).
 Dependency: extending the MSL backend's array-parameter handling to carry
@@ -164,6 +179,30 @@ Risk: medium -- some CUDA semantics (warp-level primitives, shared-memory
 bank conflicts) have no clean Metal equivalent and would need to be
 explicitly marked unsupported rather than silently approximated.
 Complexity: medium.
+
+**General `while` loops** (nested `if`/`else`, `break`, or `continue`
+inside a `while` body)
+User value: removes the current straight-line-only restriction (see
+`docs/limitations.md`) -- a `while` loop with any conditional logic in
+its body currently raises `UnsupportedFeatureError` rather than risking
+the confirmed-possible silent-wrong-result failure mode found while
+adding basic `while` support.
+Dependency: a genuine rewrite of the control-flow structurer's loop
+handling in `numba_metal/compiler/structuring.py`. Numba's bytecode
+lowering rotates `while cond: body` into a do-while-shaped CFG (the
+"body" block on the natural-exit path is often trivial, with all real
+per-iteration work and the next condition test folded into the loop
+header itself); the current structurer's `if`/`else` detection was not
+designed with this rotated shape in mind and was found, by direct
+testing, to mis-lower `break`/`continue` nested inside a conditional
+within such a loop (confirmed: swapped/wrong results, not a crash).
+Risk: high -- this is exactly the kind of control-flow-shape interaction
+bug that is easy to "fix" for one test case while silently breaking
+another; would need substantially more differential/property-based test
+coverage of generated `while`-loop shapes (extending
+`tests/differential/grammar.py`, which currently only generates
+`for x in range(...)` loops) before trusting a broader rewrite.
+Complexity: large.
 
 **Device functions** (helper functions callable from a kernel, not just
 the top-level `@metal.jit` function)

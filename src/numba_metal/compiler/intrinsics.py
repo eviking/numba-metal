@@ -21,6 +21,14 @@ from numba.extending import intrinsic
 
 MAX_GRID_DIMS = 3
 
+#: Element dtypes accepted by every atomic intrinsic below. MSL's own
+#: `atomic<T>` machinery natively supports only 32-bit int/uint/float
+#: (no 16/64-bit atomics on any Apple GPU family); this is a real,
+#: permanent MSL/hardware constraint, not an arbitrary numba-metal
+#: restriction -- see docs/architecture.md's atomics section for the
+#: exact capability probes this was verified against.
+_ATOMIC_DTYPES = (types.int32, types.uint32, types.float32)
+
 #: Scalar element dtypes accepted by metal.local_array()/shared_array().
 #: Matches the set of array-element dtypes the MSL backend can already
 #: emit a type for (numba_scalar_to_msl's domain) -- kept as an explicit
@@ -205,4 +213,120 @@ def barrier(typingctx):
     """
     restype = types.void
     sig = signature(restype)
+    return sig, _unimplemented_codegen
+
+
+# -- atomics --------------------------------------------------------------
+
+
+def _resolve_atomic_array(arr_ty, fn_name: str) -> types.Type:
+    if not isinstance(arr_ty, types.Array):
+        raise TypingError(
+            f"{fn_name}(array, index, value, ...): first argument must be "
+            f"a device array; got {arr_ty!r}."
+        )
+    if arr_ty.ndim != 1:
+        raise TypingError(
+            f"{fn_name}(array, index, value, ...): only 1D arrays are "
+            f"supported; got {arr_ty.ndim}D."
+        )
+    if arr_ty.dtype not in _ATOMIC_DTYPES:
+        raise TypingError(
+            f"{fn_name}(array, index, value, ...): array dtype must be one "
+            f"of {[str(t) for t in _ATOMIC_DTYPES]} (MSL's atomic<T> "
+            f"machinery only supports 32-bit int/uint/float on any Apple "
+            f"GPU family); got {arr_ty.dtype!r}."
+        )
+    return arr_ty.dtype
+
+
+def _make_fetch_op_intrinsic(name: str, doc: str):
+    @intrinsic
+    def _fn(typingctx, arr, idx, val):
+        elem_ty = _resolve_atomic_array(arr, f"metal.{name}")
+        sig = signature(elem_ty, arr, idx, val)
+        return sig, _unimplemented_codegen
+
+    _fn.__name__ = name
+    _fn.__doc__ = doc
+    return _fn
+
+
+atomic_add = _make_fetch_op_intrinsic(
+    "atomic_add",
+    """metal.atomic_add(array, index, value): atomically add `value` to
+    `array[index]` and return the value that was there immediately
+    before the add (MSL's `atomic_fetch_add_explicit`, relaxed memory
+    order). Supported dtypes: int32, uint32, float32 (float32 is
+    natively supported on this device -- see docs/architecture.md for
+    per-device capability probing; a device lacking native float atomics
+    would need a documented CAS-loop fallback, not silent rejection or
+    silent incorrectness -- not yet implemented for that case, see
+    docs/roadmap.md).""",
+)
+
+atomic_sub = _make_fetch_op_intrinsic(
+    "atomic_sub",
+    """metal.atomic_sub(array, index, value): atomically subtract `value`
+    from `array[index]` and return the value that was there immediately
+    before the subtraction (MSL's `atomic_fetch_sub_explicit`). Same
+    dtype support as `metal.atomic_add`.""",
+)
+
+atomic_min = _make_fetch_op_intrinsic(
+    "atomic_min",
+    """metal.atomic_min(array, index, value): atomically set
+    `array[index]` to `min(array[index], value)` and return the value
+    that was there immediately before. int32/uint32 use MSL's native
+    `atomic_fetch_min_explicit`; float32 has NO native MSL atomic
+    min/max of any kind on any Apple GPU family (verified directly: MSL
+    rejects `atomic_fetch_min_explicit`/`atomic_fetch_max_explicit` for
+    `atomic_float*` with "no matching function," a permanent language
+    limitation, not a device-capability gap) -- float32 is instead
+    lowered to a compare-and-swap retry loop, which is still genuinely
+    race-free (every thread's CAS attempt either succeeds or retries
+    against the latest value) but does more work under heavy contention
+    than a native atomic instruction. See docs/architecture.md.""",
+)
+
+atomic_max = _make_fetch_op_intrinsic(
+    "atomic_max",
+    """metal.atomic_max(array, index, value): atomically set
+    `array[index]` to `max(array[index], value)` and return the value
+    that was there immediately before. Same dtype/implementation notes
+    as `metal.atomic_min` (float32 via CAS-loop, int32/uint32 native).""",
+)
+
+atomic_exchange = _make_fetch_op_intrinsic(
+    "atomic_exchange",
+    """metal.atomic_exchange(array, index, value): atomically set
+    `array[index]` to `value` and return the value that was there
+    immediately before (MSL's `atomic_exchange_explicit`). Supported
+    dtypes: int32, uint32, float32 (native on all three for this
+    operation).""",
+)
+
+
+@intrinsic
+def atomic_compare_exchange(typingctx, arr, idx, expected, desired):
+    """metal.atomic_compare_exchange(array, index, expected, desired):
+    atomically compare `array[index]` against `expected`; if equal, set
+    it to `desired` (MSL's `atomic_compare_exchange_weak_explicit`,
+    relaxed memory order on both success and failure). Returns a
+    `(old_value, success)` tuple: `old_value` is `array[index]`'s value
+    immediately before this call (whether or not the swap happened), and
+    `success` is `True` iff the swap happened. Supported dtypes: int32,
+    uint32, float32.
+
+    Uses the *weak* compare-exchange (may spuriously fail even when
+    `array[index] == expected`, per MSL/C++ semantics) -- callers
+    building a retry loop (the overwhelmingly common use case, e.g.
+    numba-metal's own float32 `atomic_min`/`atomic_max` CAS-loop lowering
+    above) already retry on failure regardless of the failure's cause,
+    so the weak form's better performance on Apple GPU hardware is pure
+    upside with no correctness cost for that pattern. A caller needing
+    exactly one comparison (no retry) should be aware of this."""
+    elem_ty = _resolve_atomic_array(arr, "metal.atomic_compare_exchange")
+    restype = types.Tuple([elem_ty, types.boolean])
+    sig = signature(restype, arr, idx, expected, desired)
     return sig, _unimplemented_codegen

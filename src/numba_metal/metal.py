@@ -13,6 +13,12 @@ from __future__ import annotations
 import numpy as np
 
 from numba_metal.compiler.intrinsics import (  # noqa: F401 (re-exported)
+    atomic_add,
+    atomic_compare_exchange,
+    atomic_exchange,
+    atomic_max,
+    atomic_min,
+    atomic_sub,
     barrier,
     grid,
     gridsize,
@@ -42,6 +48,12 @@ __all__ = [
     "local_array",
     "shared_array",
     "barrier",
+    "atomic_add",
+    "atomic_sub",
+    "atomic_min",
+    "atomic_max",
+    "atomic_exchange",
+    "atomic_compare_exchange",
     "to_device",
     "device_array",
     "device_array_like",

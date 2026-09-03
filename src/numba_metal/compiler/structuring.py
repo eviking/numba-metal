@@ -375,7 +375,26 @@ class Structurer:
 
         loop = LoopNode(
             header_label=header,
-            pre_test=[],
+            # The header block's own statements (e.g. re-evaluating a
+            # `while` condition's operands) must execute both before the
+            # loop's first condition test (handled by the `wrapped` Seq
+            # below) AND again at the end of every subsequent iteration,
+            # immediately before the next condition test -- a `while
+            # cond:` loop re-evaluates `cond`'s operands every time
+            # through, not just once. `_emit_loop`'s native-`for`-range
+            # path never reads this field (the range-shaped header's own
+            # statements are pure iterator-protocol bookkeeping, already
+            # fully replaced by the native `for` loop's own re-evaluated
+            # C-style condition -- see `_detect_for_range`); only the
+            # generic `while (true) { ... }` fallback path re-emits
+            # `pre_test` at the bottom of the loop body. This was a real,
+            # silent-wrong-result bug found while testing a hand-written
+            # CAS retry loop (`while not done: ...`): the header's
+            # condition-feeding statements ran exactly once, so the loop
+            # body's `if (exit_cond) break;` kept re-testing a value that
+            # was never recomputed, terminating after a single iteration
+            # regardless of the loop's real trip count.
+            pre_test=list(body_stmts),
             exit_cond=cond,
             exit_cond_negated=not invert,
             body=body_node,

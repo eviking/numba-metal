@@ -7,10 +7,22 @@ gap, not evidence it works.
 
 ## Unsupported Python features
 
-- No `while` loops -- only `for x in range(...)` loop shapes are
-  recognized by the control-flow structurer. A `while` (or any other loop
-  the structurer can't match to a natural-loop-with-range-iterator shape)
-  raises `UnsupportedFeatureError`.
+- **`while` loops are supported only in straight-line form**: the loop
+  body may not contain a nested `if`/`else`, `break`, or `continue`.
+  Numba's bytecode lowering rotates `while cond: body` into a
+  do-while-shaped CFG distinct from `for x in range(...)`'s shape;
+  generalizing this backend's control-flow structurer to handle
+  break/continue nested inside a conditional within a rotated `while`
+  body was found, by direct testing, to require a substantially larger
+  structurer rewrite than in scope for the pass that added `while`
+  support -- so that specific combination is explicitly rejected with
+  `UnsupportedFeatureError` at compile time (not silently mis-lowered;
+  two intermediate, silently-wrong-result bugs were found and fixed
+  during development -- see `tests/integration/test_while_loops.py` and
+  `docs/architecture.md`). A straight-line `while` (recompute some
+  values, test a condition, repeat -- e.g. a compare-and-swap retry
+  loop, or a simple accumulation) is fully supported and tested. Any
+  other unrecognized loop shape still raises `UnsupportedFeatureError`.
 - No recursion, no calling other Python functions from within a kernel
   (no device-function support yet -- see `docs/roadmap.md`).
 - No exceptions (`try`/`except`/`raise`) inside kernels.

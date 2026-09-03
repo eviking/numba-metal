@@ -85,6 +85,29 @@ _BINOP_MSL = {
 #: Supported `math.<name>` functions (task-mandated subset).
 MATH_FUNCS = {"sqrt": "sqrt", "exp": "exp", "log": "log", "sin": "sin", "cos": "cos"}
 
+#: metal.atomic_min()/atomic_max(): native MSL atomic_fetch_min/max exist
+#: for int32/uint32 but NOT for float32 (verified directly against
+#: Apple's Metal compiler -- "no matching function," a permanent
+#: MSL-language limitation for every Apple GPU family, not a
+#: device-capability gap); float32 is lowered to a compare-and-swap
+#: retry loop instead. See docs/architecture.md.
+_ATOMIC_MINMAX_OPS: dict[object, str] = {
+    intrinsics.atomic_min: "min",
+    intrinsics.atomic_max: "max",
+}
+
+#: All metal.atomic_<op>() intrinsics handled by _emit_atomic_fetch_op
+#: (fetch-and-modify ops returning the previous value; excludes
+#: atomic_compare_exchange, which returns a (old_value, success) tuple
+#: and is handled separately by _emit_atomic_compare_exchange).
+_ATOMIC_FETCH_OP_MSL: dict[object, str] = {
+    intrinsics.atomic_add: "fetch_add",
+    intrinsics.atomic_sub: "fetch_sub",
+    intrinsics.atomic_exchange: "exchange",
+    intrinsics.atomic_min: "fetch_min",
+    intrinsics.atomic_max: "fetch_max",
+}
+
 
 @dataclass
 class ArrayParamInfo:
@@ -128,6 +151,35 @@ def nb_scalar_dtype_to_numpy(ty: nb_types.Type) -> np.dtype:
         if ty == numba_ty:
             return np.dtype(np_ty)
     raise UnsupportedFeatureError(f"Unsupported array element type {ty!r}.")
+
+
+def _reject_unsupported_while_body(node: Node) -> None:
+    """Raise UnsupportedFeatureError if `node` (a rotated-`while` loop's
+    body region, per `_emit_loop`'s docstring) contains anything beyond
+    the one verified-correct shape: a straight-line sequence of basic
+    blocks ending in the trivial back-edge block (empty statements, one
+    unconditional ContinueNode). Any IfNode, or any BreakNode/ContinueNode
+    other than that single trivial one, means this loop's real per-
+    iteration control flow is more complex than what this backend's
+    rotated-while lowering has been verified correct for -- see
+    `_emit_loop`'s comment for the confirmed-wrong-output cases this
+    guards against (break/continue nested inside an if within a while
+    body)."""
+    if isinstance(node, Seq):
+        for item in node.items:
+            _reject_unsupported_while_body(item)
+        return
+    if isinstance(node, BasicBlockNode):
+        return
+    if isinstance(node, ContinueNode):
+        return  # the one allowed occurrence: the trivial back-edge block
+    raise UnsupportedFeatureError(
+        "Unsupported `while` loop shape: a `while` loop's body may only "
+        "contain a straight-line sequence of statements (no nested "
+        "`if`/`else`, `break`, or `continue`) in this MVP -- see "
+        "docs/limitations.md. Restructure the loop, or use `for x in "
+        "range(...)` if applicable."
+    )
 
 
 def _numba_fn_to_opstr(fn) -> str:
@@ -281,6 +333,19 @@ class MSLKernelLowerer:
         # per-occurrence).
         self._threadgroup_array_targets: dict[str, _ThreadgroupArrayInfo] = {}
         self._special_array_counter = 0
+        # SSA name -> (old_value_ident, success_ident) for every
+        # metal.atomic_compare_exchange(...) call result (and every
+        # identity-copy of one produced by tuple-unpacking's
+        # exhaust_iter) -- see _emit_atomic_compare_exchange and the
+        # static_getitem/exhaust_iter branches in _emit_expr_assign.
+        self._atomic_cas_results: dict[str, tuple[str, str]] = {}
+        # SSA names structurally typed as a 2-tuple of (atomic-eligible
+        # scalar, bool) -- populated by _collect_atomic_cas_targets and
+        # consulted by _declare_locals to skip the generic per-name MSL
+        # declaration path for them (see that pre-scan method's
+        # docstring for why this structural type check, rather than
+        # call-graph tracing, is sufficient and exact).
+        self._atomic_cas_target_names: set[str] = set()
 
     def lower(self) -> str:
         """Run the full typed-IR-to-MSL lowering and return the generated
@@ -289,6 +354,7 @@ class MSLKernelLowerer:
         self._classify_params()
         self._collect_globals()
         self._collect_special_arrays()
+        self._collect_atomic_cas_targets()
         self._collect_range_calls()
         entry = min(self.func_ir.blocks.keys())
         structured = structure_function(self.func_ir.blocks, entry)
@@ -429,6 +495,14 @@ class MSLKernelLowerer:
             if name in self._local_arrays:
                 info = self._local_arrays[name]
                 self.builder.write(f"{info.msl_elem_ty} {info.ident}[{info.count}];")
+                continue
+            if name in self._atomic_cas_target_names:
+                # A metal.atomic_compare_exchange(...) call result (or an
+                # exhaust_iter identity-copy of one) -- its two
+                # underlying MSL locals are declared inline at the real
+                # call site by _emit_atomic_compare_exchange, not here;
+                # this SSA name itself never gets its own declaration
+                # (MSL has no tuple type to declare it as).
                 continue
             if isinstance(ty, (nb_types.Omitted, nb_types.NoneType)):
                 continue
@@ -631,6 +705,28 @@ class MSLKernelLowerer:
                     self._threadgroup_arrays.append(info)
                     self._threadgroup_array_targets[target_name] = info
 
+    def _collect_atomic_cas_targets(self) -> None:
+        """Pre-scan every SSA name typed as a 2-tuple of
+        (int32/uint32/float32, bool) -- the exact and only shape
+        `metal.atomic_compare_exchange(...)` (or an `exhaust_iter`
+        identity-copy of its result) can produce, since general tuple
+        construction is unsupported (see the `build_tuple` rejection in
+        `_emit_expr_assign`) -- and records them in
+        `self._atomic_cas_target_names` so `_declare_locals` skips the
+        generic (tuple-incapable) `_msl_type_for` declaration path for
+        them; their actual MSL declarations are emitted inline by
+        `_emit_atomic_compare_exchange` at the real call site instead.
+        """
+        atomic_elem_types = (nb_types.int32, nb_types.uint32, nb_types.float32)
+        for name, ty in self.typemap.items():
+            if (
+                isinstance(ty, nb_types.Tuple)
+                and len(ty.types) == 2
+                and ty.types[0] in atomic_elem_types
+                and ty.types[1] == nb_types.boolean
+            ):
+                self._atomic_cas_target_names.add(name)
+
     def _collect_range_calls(self) -> None:
         """Pre-scan (before any MSL emission) every `range(...)` call site
         so `_detect_for_range` and `_compute_suppressed_names` can use
@@ -816,15 +912,132 @@ class MSLKernelLowerer:
             self.builder.write("}")
             return
 
-        self.builder.write("while (true) {")
+        # Only a straight-line loop body (no nested if/else, break, or
+        # continue anywhere in the rotated body/pre_test regions) is
+        # supported by this generic (non-for-range) path. Numba's
+        # loop-rotation transform for `while` interacts with this
+        # backend's if/else structurer in a way that was found, by
+        # direct testing, to silently mis-lower `break`/`continue` nested
+        # inside a conditional within a `while` body (confirmed: a
+        # continue-inside-if test and a break-inside-if test produced
+        # each other's expected results, i.e. genuinely swapped/wrong
+        # control flow, not just a crash) -- fully generalizing this is
+        # a substantially larger control-flow-structurer project than a
+        # bounded bug fix, so it is deliberately out of scope here.
+        # Rejecting this shape explicitly, rather than emitting the
+        # confirmed-wrong MSL, is required by this project's no-silent-
+        # incorrect-results policy. Straight-line while bodies (the
+        # common case: recompute some values, test a condition, repeat --
+        # e.g. a compare-and-swap retry loop) ARE genuinely fixed and
+        # tested by this method; see docs/limitations.md.
+        _reject_unsupported_while_body(node.body)
+
+        # numba-metal only emits this generic form for a loop header
+        # whose OWN statements are the per-iteration condition-feeding
+        # work (Numba's bytecode lowering rotates `while cond: body`
+        # into an if-guarded do-while: the "body" region reached via
+        # `body_target`, structured into `node.body`, is a trivial
+        # back-edge block -- an empty BasicBlockNode plus an unconditional
+        # ContinueNode -- while the header block (`node.header_label`)
+        # contains one full iteration's real work followed by the NEXT
+        # condition test, captured in `node.pre_test`; see structuring
+        # .py's LoopNode.pre_test docstring for the exact CFG shape this
+        # was verified against).
+        #
+        # That back-edge block's raw IR statement list is empty, but it
+        # is NOT a no-op: DeSSAPass may have attached phi-resolution edge
+        # -copies to ITS outgoing edge specifically (e.g. `total_for_next
+        # _read = total_just_computed;`), separately from the copies
+        # attached to the header's own edge (already re-run every pass
+        # via `_emit_edge_copies(node.header_label)` below). Skipping
+        # them (an earlier version of this method did, on the mistaken
+        # assumption that an empty statement list meant nothing to emit)
+        # left every read inside the loop body referencing a stale,
+        # never-updated value -- confirmed by direct testing: a summation
+        # while-loop only ever added its first element, every subsequent
+        # pass re-reading index 0. The literal `continue;` itself is
+        # still elided (MSL's `continue` would jump past `pre_test`,
+        # skipping every real statement there every single pass), but
+        # the back-edge block's own edge-copies must still run --
+        # `_emit_basic_block` normally does exactly this (statements then
+        # edge-copies) for every ordinary block, so this handles the one
+        # case that needs the statements suppressed but the edge-copies
+        # kept.
+        #
+        # Emitted as a real MSL `do { ... } while (cond);`, not a
+        # `while (true) { ... }` with a break: a `do-while`'s `continue`
+        # jumps to the trailing `while (cond)` test, which is exactly
+        # where control needs to end up after any GENUINE `continue` a
+        # nested if/else inside `node.body` might contain (this matters
+        # once `node.body` carries real conditional break/continue logic,
+        # not just the trivial back-edge case elided above).
+        #
+        # The whole `do-while` is further guarded by `if (cond)`: a
+        # `do-while` always executes its body at least once, but the
+        # pre-loop `Seq` wrapper in structuring.py has ALREADY executed
+        # one full pass (the header, i.e. this loop's real per-iteration
+        # work) before this method runs at all, and already computed
+        # THAT pass's own exit condition. If that already-computed
+        # condition says to stop, the do-while must not run a second,
+        # unwanted pass -- omitting this guard was a real, confirmed bug
+        # (found via a hand-rolled atomic-compare-exchange retry loop):
+        # a `do-while` unconditionally repeats its body once regardless
+        # of what the condition already evaluated to, producing exactly
+        # one extra, spurious CAS attempt (which -- being a real,
+        # correctly-race-free CAS -- sometimes even "succeeded" again,
+        # corrupting the count) beyond the correct one-attempt-that-
+        # matters-per-thread flow.
+        cond_expr = self._read(node.exit_cond)
+        guard_expr = cond_expr if node.exit_cond_negated else f"!({cond_expr})"
+        self.builder.write(f"if ({guard_expr}) {{")
         with self.builder.block():
-            cond_expr = self._read(node.exit_cond)
-            if node.exit_cond_negated:
-                self.builder.write(f"if (!({cond_expr})) {{ break; }}")
-            else:
-                self.builder.write(f"if ({cond_expr}) {{ break; }}")
-            self._emit_node(node.body)
+            trivial_back_edge_label = self._trivial_back_edge_label(node.body)
+            self.builder.write("do {")
+            with self.builder.block():
+                if trivial_back_edge_label is None:
+                    self._emit_node(node.body)
+                else:
+                    self._emit_edge_copies(trivial_back_edge_label)
+                for stmt in node.pre_test:
+                    self._emit_stmt(stmt)
+                self._emit_edge_copies(node.header_label)
+            # `node.exit_cond_negated=True` means "break when `cond` is
+            # false" (the loop continues while `cond` is true), so the
+            # do-while's own trailing continuation test is `cond`
+            # unchanged; `exit_cond_negated=False` means "break when
+            # `cond` is true" (continues while `cond` is false), so the
+            # trailing test must be negated to match -- the mirror image
+            # of the break-style condition, not the same expression (and
+            # the same expression as `guard_expr` above, reused here).
+            cond_for_continue = (
+                cond_expr if node.exit_cond_negated else f"!({cond_expr})"
+            )
+            self.builder.write(f"}} while ({cond_for_continue});")
         self.builder.write("}")
+
+    def _trivial_back_edge_label(self, node: Node) -> int | None:
+        """If `node` is exactly an empty-statement-list BasicBlockNode
+        followed by an unconditional ContinueNode (Numba's rotated-
+        `while` lowering's back-edge block -- see `_emit_loop`'s
+        docstring comment), return that BasicBlockNode's label (so the
+        caller can still run ITS edge-copies, just not its -- empty --
+        statement list or the ContinueNode's literal `continue;`).
+        Returns None for any other shape. Recurses through Seq wrappers,
+        which is how the structurer represents this shape."""
+        if isinstance(node, Seq):
+            items = node.items
+            if len(items) == 1:
+                return self._trivial_back_edge_label(items[0])
+            if len(items) == 2:
+                first, second = items
+                if (
+                    isinstance(first, BasicBlockNode)
+                    and not first.body
+                    and isinstance(second, ContinueNode)
+                ):
+                    return first.label
+            return None
+        return None
 
     def _detect_for_range(self, node: LoopNode):
         """Recognize the getiter/iternext/pair_first/pair_second pattern
@@ -1119,6 +1332,16 @@ class MSLKernelLowerer:
                 target_name, f"{self._read(expr.value)}[{self._read(expr.index)}]"
             )
         elif op == "static_getitem":
+            cas_pair = self._atomic_cas_results.get(expr.value.name)
+            if cas_pair is not None:
+                # Indexing into a metal.atomic_compare_exchange(...)
+                # result tuple: [0] is the pre-swap value, [1] is the
+                # success flag, each already its own independent MSL
+                # local (see _emit_atomic_compare_exchange) rather than
+                # an indexable array/struct -- MSL has no tuple type to
+                # index into here.
+                self._assign(target_name, cas_pair[expr.index])
+                return
             self._assign(target_name, f"{self._read(expr.value)}[{expr.index}]")
         elif op == "getattr":
             if target_name in self._globals:
@@ -1139,6 +1362,15 @@ class MSLKernelLowerer:
             # the tuple value that the following static_getitem(s) index
             # into. It is NOT part of the getiter/iternext for-loop
             # protocol despite the similar-sounding name.
+            cas_pair = self._atomic_cas_results.get(expr.value.name)
+            if cas_pair is not None:
+                # Propagate the (old_value_ident, success_ident) mapping
+                # to this identity-copy's own target, so the
+                # static_getitem(s) that follow (which index into THIS
+                # target, not the original call's) still resolve
+                # correctly -- see the static_getitem branch above.
+                self._atomic_cas_results[target_name] = cas_pair
+                return
             self._assign(target_name, self._read(expr.value))
         elif op in ("pair_first", "pair_second", "iternext", "getiter"):
             pass  # consumed structurally by for-range loop detection
@@ -1251,6 +1483,12 @@ class MSLKernelLowerer:
             # must be written unconditionally.
             self.builder.write("threadgroup_barrier(mem_flags::mem_threadgroup);")
             return
+        if callee in _ATOMIC_FETCH_OP_MSL:
+            self._emit_atomic_fetch_op(target_name, callee, expr)
+            return
+        if callee is intrinsics.atomic_compare_exchange:
+            self._emit_atomic_compare_exchange(target_name, expr)
+            return
         if callee is abs:
             self._assign(target_name, f"abs({args[0]})")
             return
@@ -1348,6 +1586,120 @@ class MSLKernelLowerer:
         if name in self.typemap:
             return self._ident(name)
         raise UnsupportedFeatureError(f"Reference to undeclared variable {name!r}.")
+
+    #: MSL scalar type name -> MSL atomic type name, for the three dtypes
+    #: metal.atomic_*() support (see intrinsics._ATOMIC_DTYPES).
+    _MSL_ATOMIC_TYPE = {
+        "int": "atomic_int",
+        "uint": "atomic_uint",
+        "float": "atomic_float",
+    }
+
+    def _atomic_address_expr(self, expr: ir.Expr) -> tuple[str, str]:
+        """Given an `ir.Expr` call to one of the `metal.atomic_*()`
+        intrinsics, return `(address_expr, msl_elem_ty)`: `address_expr`
+        is a `device atomic_<T>*`-typed MSL expression pointing at
+        `array[index]` (an in-place C-style pointer-address-and-cast --
+        verified directly against Apple's Metal compiler to produce
+        correct, race-free atomics, including under real multi-thread
+        contention -- see docs/architecture.md), and `msl_elem_ty` is the
+        array's plain (non-atomic) MSL element type name (needed by
+        callers to cast literal operands to the matching type).
+        """
+        arr_var, idx_var = expr.args[0], expr.args[1]
+        arr_ty = self.typemap.get(arr_var.name)
+        elem_ty = arr_ty.dtype
+        msl_elem_ty = numba_scalar_to_msl(elem_ty)
+        atomic_ty = self._MSL_ATOMIC_TYPE.get(msl_elem_ty)
+        if atomic_ty is None:  # pragma: no cover - unreachable; intrinsics.py
+            # already restricts to _ATOMIC_DTYPES at the typing step.
+            raise UnsupportedFeatureError(
+                f"metal.atomic_*() does not support element type " f"{msl_elem_ty!r}."
+            )
+        arr_expr = self._read(arr_var)
+        idx_expr = self._read(idx_var)
+        address = f"(device {atomic_ty}*)(&{arr_expr}[{idx_expr}])"
+        return address, msl_elem_ty
+
+    def _emit_atomic_fetch_op(self, target_name: str, callee, expr: ir.Expr) -> None:
+        address, msl_elem_ty = self._atomic_address_expr(expr)
+        value_expr = self._read(expr.args[2])
+        if callee in _ATOMIC_MINMAX_OPS and msl_elem_ty == "float":
+            # No native MSL atomic_fetch_min/max exists for float on any
+            # Apple GPU family (see _ATOMIC_MINMAX_OPS's module-level
+            # comment) -- lowered to a compare-and-swap retry loop that
+            # is still race-free: every thread's CAS either installs its
+            # value (if it is still the extremum relative to whatever the
+            # memory currently holds) or discovers a newer value and
+            # retries against that.  This exact shape was verified to
+            # compile and produce correct results under real contention
+            # -- see docs/architecture.md and the atomics test suite.
+            op = _ATOMIC_MINMAX_OPS[callee]
+            cmp = ">" if op == "max" else "<"
+            tmp = f"__nbmtl_atomic_{self._special_array_counter}"
+            self._special_array_counter += 1
+            self.builder.write(f"float {tmp}_expected;")
+            self.builder.write(f"float {tmp}_val = {value_expr};")
+            self.builder.write(
+                f"{tmp}_expected = atomic_load_explicit({address}, "
+                "memory_order_relaxed);"
+            )
+            self.builder.write(f"while ({tmp}_val {cmp} {tmp}_expected) {{")
+            with self.builder.block():
+                self.builder.write(
+                    f"if (atomic_compare_exchange_weak_explicit({address}, "
+                    f"&{tmp}_expected, {tmp}_val, memory_order_relaxed, "
+                    "memory_order_relaxed)) { break; }"
+                )
+            self.builder.write("}")
+            self._assign(target_name, f"{tmp}_expected")
+            return
+        msl_op = _ATOMIC_FETCH_OP_MSL[callee]
+        casted_value = f"{msl_elem_ty}({value_expr})"
+        self._assign(
+            target_name,
+            f"atomic_{msl_op}_explicit({address}, {casted_value}, "
+            "memory_order_relaxed)",
+        )
+
+    def _emit_atomic_compare_exchange(self, target_name: str, expr: ir.Expr) -> None:
+        address, msl_elem_ty = self._atomic_address_expr(expr)
+        expected_expr = self._read(expr.args[2])
+        desired_expr = self._read(expr.args[3])
+        # atomic_compare_exchange_weak_explicit takes `expected` by
+        # pointer and overwrites it with the CURRENT value on failure
+        # (and leaves it unchanged -- equal to what was passed in -- on
+        # success), so a local variable is required regardless of
+        # whether the caller wants to observe the failure-case value;
+        # `_assign` below always declares `target_name` (a Tuple result)
+        # normally, so this temp is purely an implementation detail of
+        # calling the by-pointer MSL API, not a second declaration of the
+        # visible tuple result.
+        tmp = f"__nbmtl_cas_{self._special_array_counter}"
+        self._special_array_counter += 1
+        self.builder.write(f"{msl_elem_ty} {tmp} = {msl_elem_ty}({expected_expr});")
+        success_expr = (
+            f"atomic_compare_exchange_weak_explicit({address}, &{tmp}, "
+            f"{msl_elem_ty}({desired_expr}), memory_order_relaxed, "
+            "memory_order_relaxed)"
+        )
+        # The typed IR target of an `atomic_compare_exchange(...)` call
+        # is a 2-tuple (old_value, success); MSL has no tuple type, so
+        # this is represented as two independent MSL locals, named by
+        # convention `<ident>_0`/`<ident>_1`, matching how
+        # `static_getitem(<call target>, 0/1)` will read them back after
+        # tuple-unpacking (`old, ok = metal.atomic_compare_exchange(...)`)
+        # -- see _emit_expr_assign's static_getitem handling, which reads
+        # `self._ident(value.name)` + `[index]` for an ordinary tuple,
+        # but a 2-tuple call result here is never itself declared as an
+        # MSL array/struct, so static_getitem must be special-cased for
+        # this exact call shape (see _read/_getitem interception below).
+        ident = self._ident(target_name)
+        self._atomic_cas_results[target_name] = (f"{ident}_0", f"{ident}_1")
+        self.builder.write(f"{msl_elem_ty} {ident}_0;")
+        self.builder.write("bool " + f"{ident}_1;")
+        self.builder.write(f"{ident}_1 = {success_expr};")
+        self.builder.write(f"{ident}_0 = {tmp};")
 
     def _const_text(self, py_val, target_name: str) -> str:
         if isinstance(py_val, bool):
