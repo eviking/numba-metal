@@ -100,10 +100,10 @@ def test_atomic_sub_exact_under_heavy_contention() -> None:
 
 
 def test_atomic_add_uniform_distribution_across_few_pixels() -> None:
-    """A Datashader-style scatter-reduce pattern: many threads, but only
-    a handful of distinct target elements (uniform-but-clustered
-    contention), not one single element -- verifies atomics are correct
-    when contention is spread over multiple addresses simultaneously."""
+    """A scatter-reduce pattern with many threads, but only a handful of
+    distinct target elements (uniform-but-clustered contention), not one
+    single element -- verifies atomics are correct when contention is
+    spread over multiple addresses simultaneously."""
     metal = _metal()
 
     @metal.jit

@@ -34,6 +34,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install package
         run: pip install -e ".[dev]"
+      - name: Repository boundary check (no Datashader in numba-metal)
+        # numba-metal owns only reusable Numba-to-Metal compiler/runtime
+        # functionality; Datashader-specific code belongs exclusively in
+        # the sibling datashader-metal repository. See
+        # ../datashader-metal/docs/REPOSITORY_BOUNDARIES.md for the full
+        # ownership split. This check fails the build if that boundary is
+        # ever crossed, whether via an import, a dependency declaration,
+        # or vendored source/benchmarks/examples.
+        run: |
+          set -euo pipefail
+          if grep -rIliE '\b(datashader|data-shader)\b' \
+              --include='*.py' --include='*.toml' --include='*.cfg' --include='*.txt' \
+              src tests benchmarks pyproject.toml \
+              | grep -v -F 'docs/'; then
+            echo "::error::Found a Datashader reference inside numba-metal; this must live in datashader-metal instead."
+            exit 1
+          fi
+          echo "No Datashader references found outside docs/."
       - name: Lint
         run: ruff check src tests benchmarks
       - name: Format check
