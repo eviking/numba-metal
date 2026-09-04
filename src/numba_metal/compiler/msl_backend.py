@@ -431,43 +431,41 @@ class MSLKernelLowerer:
 
     def _classify_params(self) -> None:
         for name, ty in zip(self.typed.arg_names, self.typed.arg_types, strict=True):
-            if self.device_function:
-                if not isinstance(
-                    ty, (nb_types.Integer, nb_types.Float, nb_types.Boolean)
-                ):
-                    raise UnsupportedFeatureError(
-                        f"@metal.device_func argument {name!r} has "
-                        f"unsupported type {ty!r}. Device functions only "
-                        "support scalar (int32/uint32/int64/float32/"
-                        "float16/bool) arguments -- no arrays, no "
-                        "metal.local_array()/shared_array()."
-                    )
-                self.sig.scalar_params.append((name, ty))
-                self.sig.param_order.append(("scalar", name))
-                self._scalar_names.add(name)
-                continue
             if isinstance(ty, nb_types.Array):
                 if ty.ndim != 1:
+                    kind = "@metal.device_func argument" if self.device_function else (
+                        "Kernel argument"
+                    )
                     raise UnsupportedFeatureError(
-                        f"Kernel argument {name!r} has {ty.ndim} dimensions; "
-                        "numba-metal only supports 1D arrays as kernel "
-                        "arguments in this MVP (use flattened indexing for "
-                        "multi-dimensional data -- see docs/limitations.md)."
+                        f"{kind} {name!r} has {ty.ndim} dimensions; "
+                        "numba-metal only supports 1D arrays as kernel or "
+                        "device-function arguments in this MVP (use "
+                        "flattened indexing for multi-dimensional data -- "
+                        "see docs/limitations.md)."
                     )
                 np_dtype = nb_scalar_dtype_to_numpy(ty.dtype)
                 self.sig.array_params.append(ArrayParamInfo(name, np_dtype, ty.ndim))
                 self.sig.param_order.append(("array", name))
                 self._array_names.add(name)
-            elif isinstance(ty, (nb_types.Integer, nb_types.Float, nb_types.Boolean)):
+                continue
+            if isinstance(ty, (nb_types.Integer, nb_types.Float, nb_types.Boolean)):
                 self.sig.scalar_params.append((name, ty))
                 self.sig.param_order.append(("scalar", name))
                 self._scalar_names.add(name)
-            else:
+                continue
+            if self.device_function:
                 raise UnsupportedFeatureError(
-                    f"Kernel argument {name!r} has unsupported type {ty!r}. "
-                    "Supported argument types: 1D arrays of a supported "
-                    "dtype, and scalar int32/uint32/int64/float32/bool."
+                    f"@metal.device_func argument {name!r} has "
+                    f"unsupported type {ty!r}. Device functions only "
+                    "support scalar (int32/uint32/int64/float32/float16/"
+                    "bool) arguments and 1D arrays of a supported dtype -- "
+                    "no metal.local_array()/shared_array()."
                 )
+            raise UnsupportedFeatureError(
+                f"Kernel argument {name!r} has unsupported type {ty!r}. "
+                "Supported argument types: 1D arrays of a supported "
+                "dtype, and scalar int32/uint32/int64/float32/bool."
+            )
 
     def _emit_signature(self) -> None:
         if self.device_function:
@@ -523,11 +521,27 @@ class MSLKernelLowerer:
         """Emit an ordinary C-style MSL function signature for a
         `@metal.device_func` (no `[[buffer(n)]]`/thread-position
         parameters -- those only make sense for a top-level `kernel
-        void` entry point; a device function only ever runs as part of
-        whatever kernel called it, with plain by-value scalar
-        arguments)."""
+        void` entry point; a device function runs as part of whatever
+        kernel called it, taking plain by-value scalar arguments and/or
+        `device T*`-typed array arguments -- the same `device` address
+        space every kernel-level array argument already lives in, since a
+        device function is only ever called (directly or transitively)
+        from within a kernel body operating on that same buffer, never
+        from `threadgroup`/`constant` address space. This is also why
+        `metal.atomic_*()` intrinsics work identically inside a device
+        function's body: `_atomic_address_expr` always casts to `(device
+        atomic_<T>*)`, matching the address space an array parameter is
+        declared with here exactly, regardless of whether the array
+        currently being indexed is a kernel argument or was passed down
+        into a device function."""
         params = []
-        for _kind, name in self.sig.param_order:
+        for kind, name in self.sig.param_order:
+            if kind == "array":
+                info = next(a for a in self.sig.array_params if a.name == name)
+                msl_ty = numpy_dtype_to_msl(info.dtype)
+                params.append(f"device {msl_ty}* arg_{name}")
+                params.append(f"uint arg_{name}_size")
+                continue
             _, ty = next(s for s in self.sig.scalar_params if s[0] == name)
             # Same float64->float32 narrowing as the return type below:
             # a caller passing a bare Python float literal (e.g.
@@ -1640,7 +1654,19 @@ class MSLKernelLowerer:
             device_func_name = self._compile_device_function(
                 device_function_py_func(callee), arg_types
             )
-            self._assign(target_name, f"{device_func_name}({', '.join(args)})")
+            # Every array-typed argument expands to two MSL call
+            # arguments (the `device T*` pointer plus its `_size`
+            # companion), matching _emit_device_function_signature's
+            # two-parameter-per-array emission -- an array argument is
+            # always a plain SSA variable reference here (arrays cannot
+            # be produced by an inline expression), so `a.name` is always
+            # a real typemap/array-name entry, never a temporary.
+            call_args = []
+            for a, arg_expr in zip(expr.args, args, strict=True):
+                call_args.append(arg_expr)
+                if a.name in self._array_names:
+                    call_args.append(f"arg_{a.name}_size")
+            self._assign(target_name, f"{device_func_name}({', '.join(call_args)})")
             return
 
         if callee is bool:

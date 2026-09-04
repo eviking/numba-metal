@@ -3,13 +3,39 @@ memory allocation, barriers, and atomics.
 
 These are typed using `numba.extending.intrinsic` purely so Numba's type
 inference accepts calls to them inside a kernel and produces a normal typed
-`ir.Expr.call` node with a known return type. Their `codegen` callbacks are
-never invoked: numba-metal never runs Numba's LLVM lowering. Instead,
+`ir.Expr.call` node with a known return type. For a call inside an ordinary
+`@metal.jit` kernel body, their `codegen` callbacks are never invoked:
+numba-metal never runs Numba's LLVM lowering for a kernel.
 `numba_metal.compiler.msl_backend` pattern-matches calls to these exact
 function objects while walking the typed IR and emits the corresponding MSL
 expression/statement directly. This split (real typing, intercepted
 lowering) was verified empirically against this Numba version before
 committing to it -- see docs/architecture.md.
+
+The atomic intrinsics below are the one exception with a REAL `codegen` (not
+`_unimplemented_codegen`): `@metal.device_func` (runtime/dispatcher.py) wraps
+its target with a genuine `njit` dispatcher so Numba's own frontend can type
+a *caller's* call site the same way it types any ordinary function call --
+but typing a call to a Numba Dispatcher requires that dispatcher to actually
+produce a compiled overload (`Dispatcher.compile()`), which unavoidably runs
+real CPU lowering of the device function's entire body, not just its typing.
+A device function that calls an atomic intrinsic therefore forces that
+intrinsic's `codegen` to run for real during this throwaway CPU compile
+(never actually executed -- only the resulting overload's *type signature*
+is consulted by the caller's frontend; the MSL backend always re-derives the
+real GPU semantics from the original plain function's typed IR via
+`msl_backend._compile_device_function`, never from this CPU-lowered
+version). A correct single-threaded sequential CPU implementation is used
+for exactly this reason: it is semantically valid standalone Python/Numba
+(no real concurrency exists in this throwaway compile), safe to keep even if
+future code called it directly, and avoids special-casing device-function
+compilation around Numba Dispatcher internals just to suppress lowering.
+`metal.grid`/`gridsize`/thread-position/`local_array`/`shared_array`/
+`barrier` do not have this problem in practice because a device function
+calling any of those has no meaningful CPU (or, for that matter, GPU
+outside a real dispatch) semantics to fall back to and remains out of
+scope -- calling one from inside a `@metal.device_func` continues to raise
+via `_unimplemented_codegen` exactly as before.
 """
 
 from __future__ import annotations
@@ -240,12 +266,60 @@ def _resolve_atomic_array(arr_ty, fn_name: str) -> types.Type:
     return arr_ty.dtype
 
 
+def _atomic_add_pyfunc(arr, idx, val):
+    old = arr[idx]
+    arr[idx] = old + val
+    return old
+
+
+def _atomic_sub_pyfunc(arr, idx, val):
+    old = arr[idx]
+    arr[idx] = old - val
+    return old
+
+
+def _atomic_min_pyfunc(arr, idx, val):
+    old = arr[idx]
+    arr[idx] = min(old, val)
+    return old
+
+
+def _atomic_max_pyfunc(arr, idx, val):
+    old = arr[idx]
+    arr[idx] = max(old, val)
+    return old
+
+
+def _atomic_exchange_pyfunc(arr, idx, val):
+    old = arr[idx]
+    arr[idx] = val
+    return old
+
+
+#: Sequential (non-atomic) Python equivalent for each fetch-and-modify
+#: intrinsic, compiled via `context.compile_internal` -- see this module's
+#: docstring for why a real, single-threaded CPU implementation (rather
+#: than `_unimplemented_codegen`) is needed and safe here.
+_FETCH_OP_PYFUNC = {
+    "atomic_add": _atomic_add_pyfunc,
+    "atomic_sub": _atomic_sub_pyfunc,
+    "atomic_min": _atomic_min_pyfunc,
+    "atomic_max": _atomic_max_pyfunc,
+    "atomic_exchange": _atomic_exchange_pyfunc,
+}
+
+
 def _make_fetch_op_intrinsic(name: str, doc: str):
     @intrinsic
     def _fn(typingctx, arr, idx, val):
         elem_ty = _resolve_atomic_array(arr, f"metal.{name}")
         sig = signature(elem_ty, arr, idx, val)
-        return sig, _unimplemented_codegen
+        pyfunc = _FETCH_OP_PYFUNC[name]
+
+        def codegen(context, builder, sig, args):
+            return context.compile_internal(builder, pyfunc, sig, args)
+
+        return sig, codegen
 
     _fn.__name__ = name
     _fn.__doc__ = doc
@@ -329,4 +403,18 @@ def atomic_compare_exchange(typingctx, arr, idx, expected, desired):
     elem_ty = _resolve_atomic_array(arr, "metal.atomic_compare_exchange")
     restype = types.Tuple([elem_ty, types.boolean])
     sig = signature(restype, arr, idx, expected, desired)
-    return sig, _unimplemented_codegen
+
+    def codegen(context, builder, sig, args):
+        return context.compile_internal(
+            builder, _atomic_compare_exchange_pyfunc, sig, args
+        )
+
+    return sig, codegen
+
+
+def _atomic_compare_exchange_pyfunc(arr, idx, expected, desired):
+    old = arr[idx]
+    ok = old == expected
+    if ok:
+        arr[idx] = desired
+    return old, ok

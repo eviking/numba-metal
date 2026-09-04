@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased (device-function array arguments)
+
+### Added
+
+- **`@metal.device_func` now accepts 1D array arguments**, matching the
+  existing constraints on kernel array arguments (1D only, same
+  supported-dtype set). Previously scalar-argument-only. A device
+  function's array parameter is emitted in the same `device`-address-space
+  MSL pointer form a kernel-level array argument already uses, so
+  `metal.atomic_*()` intrinsics (which always cast to `device atomic_<T>*`)
+  work correctly whether the array being indexed is a kernel argument or
+  was forwarded into a device function.
+- **`metal.atomic_add`/`atomic_sub`/`atomic_min`/`atomic_max`/
+  `atomic_exchange`/`atomic_compare_exchange` are now usable from inside a
+  `@metal.device_func` body**, including a `while`-loop compare-and-swap
+  retry pattern -- verified under real multi-thread contention against a
+  sequential reference, not merely "compiles." This required giving these
+  six intrinsics a real (previously `_unimplemented_codegen`) CPU
+  `codegen`, compiled via `context.compile_internal`: `@metal.device_func`
+  wraps its target in a real `njit` dispatcher so a *caller's* frontend can
+  type the call site, and typing a Dispatcher call unavoidably forces
+  Numba to fully compile (and lower) that dispatcher, including any atomic
+  intrinsic calls in its body -- this CPU-lowered version is never
+  actually executed (the MSL backend always re-derives real GPU semantics
+  from the original plain function's typed IR), but it must not crash
+  during that throwaway compile. A correct single-threaded sequential
+  implementation is safe here since no real concurrency exists in that
+  throwaway compile. `metal.grid`/`gridsize`/thread-position/
+  `local_array`/`shared_array`/`barrier` remain kernel-only and still
+  raise if called from a device function (they have no meaningful
+  standalone CPU or out-of-dispatch GPU semantics to fall back to).
+- New tests: `tests/integration/test_device_functions.py` gains array
+  -argument, mixed array/scalar-signature, nested-call array-forwarding,
+  atomic-CAS-loop-under-contention, and 2D-array-rejection cases.
+
 ## Unreleased (post-MVP hardening pass)
 
 A correctness- and evidence-focused hardening pass over the initial MVP
