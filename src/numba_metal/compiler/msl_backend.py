@@ -1775,6 +1775,34 @@ class MSLKernelLowerer:
         name = var.name
         if name in self._array_names or name in self._scalar_names:
             return f"arg_{name}"
+        if name in self._globals:
+            # A direct reference to a module-level global/freevar (e.g. a
+            # module-level `N = 32` used as a range() bound, an array
+            # size, or any other operand). `_emit_assign` deliberately
+            # never emits a declaration or assignment for an
+            # ir.Global/ir.FreeVar-valued SSA name (see its comment
+            # "resolved at call sites via self._globals") -- that scheme
+            # only actually worked for *callable* globals (metal.grid,
+            # range, math.sqrt, ...), which are consumed exclusively via
+            # `_resolve_global`/`_call` and never flow through `_read` at
+            # all. A non-callable global (a plain int/float/bool
+            # constant) DOES flow through `_read` whenever it's used as a
+            # value -- e.g. `range(N)`, `x + N`, `if i < N` -- and
+            # without this branch, `_read` fell through to `_ident(name)`
+            # and returned an identifier for a SSA variable that was
+            # never declared or assigned anything, since `_declare_locals`
+            # has no exclusion for it either: MSL then default-initializes
+            # that `long`/`int`/etc. to (observed) zero, silently making
+            # every such reference read as 0 instead of the real constant
+            # (concretely: `for j in range(N)` with a zero stop bound
+            # runs its body zero times). Resolve it to the same literal
+            # MSL text a `Const` of the same value would produce, exactly
+            # as `_emit_assign` already does for `ir.Const` via
+            # `_const_text`, so a global constant behaves identically to
+            # writing the literal inline.
+            value = self._globals[name]
+            if isinstance(value, (bool, int, float)):
+                return self._const_text(value, name)
         if name in self.typemap:
             return self._ident(name)
         raise UnsupportedFeatureError(f"Reference to undeclared variable {name!r}.")

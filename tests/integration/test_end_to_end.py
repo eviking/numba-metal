@@ -14,6 +14,19 @@ import pytest
 
 pytestmark = pytest.mark.metal
 
+#: Module-level constants used by the tests below that exercise a
+#: `range()` bound (or other operand) sourced from a global rather than a
+#: literal or a kernel argument -- see `test_range_stop_from_module_global`
+#: and friends. Deliberately plain module-level ints, matching the shape
+#: numba-metal's own docs describe as supported ("Closures over outer-
+#: scope non-constant variables" are unsupported, but "module-level
+#: globals" are explicitly the supported case -- see docs/limitations.md).
+LOOP_BOUND = 32
+RANGE_START_GLOBAL = 5
+RANGE_STOP_GLOBAL = 20
+RANGE_STEP_GLOBAL = 3
+ARITH_CONSTANT = 100
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _metal_module():
@@ -107,6 +120,118 @@ def test_for_loop_with_runtime_bound() -> None:
     k[1, 8](d_out, np.int32(10))
     metal.synchronize()
     assert np.all(d_out.copy_to_host() == sum(range(10)))
+
+
+def test_range_stop_from_module_global() -> None:
+    """Regression test: a module-level global int constant used as a
+    `range()` *stop* bound previously compiled to a loop that ran its
+    body zero times, instead of `LOOP_BOUND` times. `_read()` (the MSL
+    backend's variable-value resolver) had no branch for a name whose
+    value came from an `ir.Global`/`ir.FreeVar` load; `_emit_assign`
+    deliberately never declares or assigns such a name (its value is
+    resolved separately, via `self._globals`, at call sites like
+    `metal.grid(...)`/`range(...)`'s *callee*) -- but nothing resolved
+    the VALUE of a non-callable global used as an ordinary operand, so
+    the generated MSL referenced an undeclared-and-therefore-zero-
+    initialized local for the range's stop bound. Fixed generically in
+    `MSLKernelLowerer._read`: any name resolving through `self._globals`
+    to a plain bool/int/float now emits that literal's MSL text, exactly
+    as an `ir.Const` of the same value already would."""
+    metal = _metal()
+
+    @metal.jit
+    def k(out, n):
+        i = metal.grid(1)
+        if i < n:
+            total = 0
+            for _j in range(LOOP_BOUND):
+                total = total + 1
+            out[i] = total
+
+    d_out = metal.device_array(3, np.int32)
+    k[1, 3](d_out, np.int32(3))
+    metal.synchronize()
+    assert np.array_equal(d_out.copy_to_host(), np.full(3, LOOP_BOUND, dtype=np.int32))
+
+
+def test_range_start_stop_step_from_module_globals() -> None:
+    """Same underlying bug (see `test_range_stop_from_module_global`), but
+    covering all three `range()` arguments sourced from module-level
+    globals at once, not just `stop` -- `_detect_for_range` extracts
+    `start`/`stop`/`step` independently (`_RangeCallInfo`), so each is an
+    independent opportunity for the same failure mode."""
+    metal = _metal()
+
+    @metal.jit
+    def k(out):
+        i = metal.grid(1)
+        if i < out.size:
+            total = 0
+            for j in range(RANGE_START_GLOBAL, RANGE_STOP_GLOBAL, RANGE_STEP_GLOBAL):
+                total = total + j
+            out[i] = total
+
+    expected = sum(range(RANGE_START_GLOBAL, RANGE_STOP_GLOBAL, RANGE_STEP_GLOBAL))
+    d_out = metal.device_array(4, np.int32)
+    k[1, 4](d_out)
+    metal.synchronize()
+    assert np.array_equal(d_out.copy_to_host(), np.full(4, expected, dtype=np.int32))
+
+
+def test_module_global_in_arithmetic_expression() -> None:
+    """A module-level global referenced directly as an arithmetic operand
+    (not inside a `range()` call at all) exercises the same `_read()`
+    path fixed for the range-bound case -- confirming the fix is general
+    (in `_read`, used by every expression/statement that reads a
+    variable's value), not special-cased to `range()`'s argument-
+    extraction code path specifically."""
+    metal = _metal()
+
+    @metal.jit
+    def k(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = a[i] + ARITH_CONSTANT
+
+    a = np.arange(10, dtype=np.int32)
+    d_a = metal.to_device(a)
+    d_out = metal.device_array(10, np.int32)
+    k[1, 10](d_a, d_out)
+    metal.synchronize()
+    assert np.array_equal(d_out.copy_to_host(), a + ARITH_CONSTANT)
+
+
+def test_module_global_bound_in_nested_loop_and_conditional() -> None:
+    """A module-level global used as a `range()` stop bound for the
+    *inner* loop of a nested loop, with the accumulation additionally
+    gated by an `if`, guards against a fix that only special-cased the
+    single-loop repro shape rather than resolving the global's value
+    generically wherever `_read()` is invoked."""
+    metal = _metal()
+
+    @metal.jit
+    def k(out):
+        i = metal.grid(1)
+        if i < out.size:
+            total = 0
+            for _outer in range(3):
+                for inner in range(LOOP_BOUND):
+                    if inner % 2 == 0:
+                        total = total + 1
+            out[i] = total
+
+    def reference() -> int:
+        total = 0
+        for _outer in range(3):
+            for inner in range(LOOP_BOUND):
+                if inner % 2 == 0:
+                    total += 1
+        return total
+
+    d_out = metal.device_array(5, np.int32)
+    k[1, 5](d_out)
+    metal.synchronize()
+    assert np.array_equal(d_out.copy_to_host(), np.full(5, reference(), dtype=np.int32))
 
 
 def test_math_functions_match_numpy() -> None:

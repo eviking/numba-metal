@@ -209,6 +209,34 @@ block-scoped), from the typemap -- this mirrors how Numba's own SSA form
 already treats every `Var` as function-scoped, and sidesteps MSL's
 declare-before-use requirement without needing separate scope tracking.
 
+**A concrete silent-wrong-result bug found and fixed**: a module-level
+global/freevar `int`/`float`/`bool` constant referenced as an ordinary
+*value* -- a `range()` bound, an arithmetic operand, a comparison operand,
+anything other than the callable-global shapes (`metal.grid`, `range`,
+`math.sqrt`, ...) that `self._globals`/`_resolve_global` already
+resolved -- compiled to a reference to a never-declared-or-assigned MSL
+local instead of the constant's actual value. `_emit_assign` deliberately
+emits nothing for an `ir.Global`/`ir.FreeVar`-valued assignment (the
+comment there says "resolved at call sites via `self._globals`"), which
+is correct for a *callable* global (its value is consumed only by
+`_resolve_global` at the call site, e.g. recognizing `range(...)`'s
+callee), but that scheme never actually resolved the *value* of a
+non-callable global used as a plain operand -- `_read()` had no branch
+consulting `self._globals` at all, so it fell through to returning a
+bare MSL identifier for a variable `_declare_locals` had no reason to
+exclude, which MSL then default-initialized to zero. Concretely: `for j
+in range(N)` with `N` a module-level `N = 32` compiled to a `for` loop
+whose stop bound read an uninitialized-to-zero local, so the loop body
+ran zero times -- while `range(32)` (a literal) compiled correctly,
+since a literal reaches this same code path as an `ir.Const`, handled
+separately by `_const_text`. Fixed by making `_read()` resolve any name
+found in `self._globals` whose value is a plain `bool`/`int`/`float` to
+that value's literal MSL text (the same `_const_text` a `Const` of the
+identical value already produces), covering every operand position, not
+just `range()`'s bounds specifically. See
+`tests/integration/test_end_to_end.py`'s
+`test_range_stop_from_module_global` and neighboring tests.
+
 ### 3. Thread/threadgroup indexing, local/shared memory, barriers, atomics
 
 These are all implemented as `numba.extending.intrinsic`-typed functions
