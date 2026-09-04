@@ -68,6 +68,16 @@ class SubmissionRecord:
     lifetimes on its own; only pyobjc's normal reference counting does,
     so this list is what keeps them alive across the async GPU execution
     window between `commit()` and `waitUntilCompleted()`.
+
+    `reusable_buffers` is the subset of `resources` (if any) that are
+    eligible to be returned to `_MetalContext`'s scalar-buffer pool once
+    this submission is confirmed complete (see
+    `runtime/dispatcher.py`'s buffer-reuse pool) -- kept as a separate
+    list rather than reusing all of `resources`, since `resources` also
+    includes the pipeline state and device-array buffers, which are
+    never pool-managed (a device array's buffer is owned by its
+    `DeviceNDArray` for that array's entire lifetime, not per-dispatch).
+    Each entry is `(byte_size, buffer)`.
     """
 
     sequence: int
@@ -75,6 +85,7 @@ class SubmissionRecord:
     command_buffer: Any
     resources: list[Any] = field(default_factory=list)
     msl_source: str | None = None
+    reusable_buffers: list[tuple[int, Any]] = field(default_factory=list)
 
 
 class _MetalContext:
@@ -92,6 +103,23 @@ class _MetalContext:
         # contend with each other unnecessarily).
         self._outstanding_lock = threading.Lock()
         self._outstanding: list[SubmissionRecord] = []
+        # Process-wide pool of small scalar-argument MTLBuffers
+        # (byte_size -> free buffers of that exact size), reused across
+        # dispatches instead of allocating a fresh MTLBuffer for every
+        # scalar kernel argument on every single launch (see
+        # runtime/dispatcher.py's `_acquire_scalar_buffer`). A buffer
+        # only re-enters this pool once `synchronize()` has confirmed
+        # every outstanding command buffer that might still be reading
+        # it has completed -- see `synchronize()` below and
+        # `SubmissionRecord.reusable_buffers`. This is the ONLY point at
+        # which a pooled buffer becomes available again, so reuse never
+        # races an in-flight kernel that could still be reading the old
+        # contents: the exact same "wait before touching shared memory"
+        # discipline already used for `copy_to_host`/`copy_to_device`
+        # (see runtime/array.py), applied here to buffer *recycling*
+        # rather than host access.
+        self._scalar_buffer_pool_lock = threading.Lock()
+        self._scalar_buffer_pool: dict[int, list[Any]] = {}
 
     def _ensure_initialized(self) -> None:
         if self._device is not None:
@@ -136,21 +164,54 @@ class _MetalContext:
         kernel_name: str,
         resources: list[Any],
         msl_source: str | None = None,
+        reusable_buffers: list[tuple[int, Any]] | None = None,
     ) -> SubmissionRecord:
         """Register a just-submitted (already committed, or about to be
         committed by the caller) command buffer for tracking. Must be
         called for every command buffer numba-metal submits, before or
-        immediately after `commit()`, so `synchronize()` can find it."""
+        immediately after `commit()`, so `synchronize()` can find it.
+
+        `reusable_buffers`: `(byte_size, buffer)` pairs eligible to be
+        returned to the scalar-buffer pool once this submission is
+        confirmed complete with no error (see `synchronize()` and
+        `acquire_scalar_buffer`).
+        """
         record = SubmissionRecord(
             sequence=next(_sequence_counter),
             kernel_name=kernel_name,
             command_buffer=command_buffer,
             resources=resources,
             msl_source=msl_source,
+            reusable_buffers=reusable_buffers or [],
         )
         with self._outstanding_lock:
             self._outstanding.append(record)
         return record
+
+    def acquire_scalar_buffer(self, byte_size: int):
+        """Pop a pooled MTLBuffer of exactly `byte_size` bytes, or return
+        `None` if the pool has none available (caller must allocate a
+        fresh one). See `__init__`'s docstring for why a pooled buffer is
+        always safe to reuse the moment it is popped -- it can only have
+        been placed here by `synchronize()`, after confirming no
+        outstanding command buffer might still be reading it."""
+        with self._scalar_buffer_pool_lock:
+            bucket = self._scalar_buffer_pool.get(byte_size)
+            if bucket:
+                return bucket.pop()
+        return None
+
+    def _release_scalar_buffers(self, buffers: list[tuple[int, Any]]) -> None:
+        with self._scalar_buffer_pool_lock:
+            for byte_size, buf in buffers:
+                self._scalar_buffer_pool.setdefault(byte_size, []).append(buf)
+
+    def scalar_buffer_pool_size(self) -> int:
+        """Total number of buffers currently sitting in the reuse pool
+        (across all sizes) -- exposed for tests verifying pooling
+        behavior, not part of the normal execution path."""
+        with self._scalar_buffer_pool_lock:
+            return sum(len(v) for v in self._scalar_buffer_pool.values())
 
     def synchronize(self) -> None:
         """Block until all previously submitted command buffers have
@@ -174,11 +235,24 @@ class _MetalContext:
             self._outstanding.clear()
 
         failures: list[tuple[SubmissionRecord, Any]] = []
+        reclaimed_buffers: list[tuple[int, Any]] = []
         for record in pending:
             record.command_buffer.waitUntilCompleted()
             status = record.command_buffer.status()
             if status == _MTL_COMMAND_BUFFER_STATUS_ERROR:
                 failures.append((record, record.command_buffer.error()))
+            elif record.reusable_buffers:
+                # Only a cleanly-completed submission's buffers are
+                # returned to the pool -- a buffer touched by a failed
+                # command buffer is in an unknown/ambiguous state (the
+                # GPU may have partially written it, or the failure may
+                # itself be buffer-related), so it is simply dropped
+                # (garbage-collected normally) rather than risked in a
+                # future dispatch.
+                reclaimed_buffers.extend(record.reusable_buffers)
+
+        if reclaimed_buffers:
+            self._release_scalar_buffers(reclaimed_buffers)
 
         # Resources are released here (by falling out of scope) only after
         # every buffer has been confirmed complete -- this is what
@@ -217,3 +291,100 @@ _context = _MetalContext()
 def get_context() -> _MetalContext:
     """Return the process-wide Metal context, initializing it if needed."""
     return _context
+
+
+class _BatchState:
+    """Accumulates multiple kernel launches' encoded work onto ONE
+    shared `MTLCommandBuffer`, committed and registered as a single
+    `SubmissionRecord` when the batch ends (see `metal.batch()` in
+    `metal.py`), instead of `dispatcher.py`'s normal one-command-buffer
+    -per-launch behavior.
+
+    Thread-local (via `_batch_state` below, a `threading.local`): two
+    threads batching concurrently must never see or contend over each
+    other's in-progress command buffer -- each thread gets its own
+    independent batch state, matching this project's existing
+    thread-safety conventions (the outstanding-submission registry and
+    scalar-buffer pool are already lock-protected shared state; a batch
+    -in-progress command buffer is instead kept OUT of shared state
+    entirely, avoiding the need for a lock at all for the common case of
+    one thread batching its own sequential launches).
+    """
+
+    def __init__(self, command_buffer: Any) -> None:
+        self.command_buffer = command_buffer
+        self.resources: list[Any] = []
+        self.reusable_buffers: list[tuple[int, Any]] = []
+        self.kernel_names: list[str] = []
+        self.msl_sources: list[str] = []
+
+
+_batch_state_local = threading.local()
+
+
+def current_batch() -> _BatchState | None:
+    """The calling thread's in-progress `metal.batch()` state, or `None`
+    if the calling thread is not currently inside a `metal.batch()`
+    block. Consulted by `dispatcher.py`'s `_dispatch` to decide whether
+    to encode onto an existing shared command buffer instead of creating
+    and committing its own."""
+    return getattr(_batch_state_local, "state", None)
+
+
+def begin_batch() -> _BatchState:
+    """Start a new batch on the calling thread: allocates one shared
+    `MTLCommandBuffer` that subsequent launches on this thread will
+    encode onto, until `end_batch()` commits and registers it. Raises if
+    a batch is already in progress on this thread (`metal.batch()`
+    blocks are not reentrant/nestable -- see that function's docstring
+    for why)."""
+    if current_batch() is not None:
+        raise MetalRuntimeError(
+            "metal.batch() blocks cannot be nested on the same thread; "
+            "a batch is already in progress."
+        )
+    ctx = get_context()
+    cmdbuf = ctx.queue.commandBuffer()
+    state = _BatchState(cmdbuf)
+    _batch_state_local.state = state
+    return state
+
+
+def discard_batch() -> None:
+    """Abandon the calling thread's in-progress batch without committing
+    its command buffer -- used when an exception propagates out of a
+    `metal.batch()` block (see `metal.py`'s `_BatchContextManager`).
+    None of the launches encoded onto the batch's command buffer so far
+    ever run: an uncommitted `MTLCommandBuffer` is simply released
+    (garbage-collected normally) with no GPU-side effect at all."""
+    _batch_state_local.state = None
+
+
+def end_batch() -> SubmissionRecord | None:
+    """End the calling thread's in-progress batch: commits the shared
+    command buffer (if at least one kernel was launched inside the
+    batch; an empty `metal.batch()` block commits nothing, matching
+    `synchronize()`'s existing "safe no-op on nothing pending" contract)
+    and registers exactly one `SubmissionRecord` covering every launch
+    that was encoded onto it. Returns that record, or `None` if the
+    batch was empty."""
+    state = current_batch()
+    if state is None:  # pragma: no cover - defensive; metal.batch() always pairs these
+        raise MetalRuntimeError("end_batch() called with no batch in progress.")
+    _batch_state_local.state = None
+    if not state.kernel_names:
+        return None
+    ctx = get_context()
+    state.command_buffer.commit()
+    combined_name = (
+        state.kernel_names[0]
+        if len(state.kernel_names) == 1
+        else f"batch[{', '.join(state.kernel_names)}]"
+    )
+    return ctx.register_submission(
+        command_buffer=state.command_buffer,
+        kernel_name=combined_name,
+        resources=state.resources,
+        msl_source="\n\n".join(state.msl_sources),
+        reusable_buffers=state.reusable_buffers,
+    )

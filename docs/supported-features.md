@@ -119,9 +119,11 @@ scale used, and the gaps found and closed while producing that audit.
 | `metal.synchronize()` | Supported | Waits on and inspects the status/error of every outstanding tracked command buffer (not a single barrier); raises `MetalRuntimeError` naming the specific failing kernel and submission number -- see docs/architecture.md, "Command-buffer tracking and error propagation" |
 | Repeated kernel launches | Supported | |
 | Compilation cache (source + signature + device) | Supported | In-process only; not persisted to disk (see `docs/roadmap.md`) |
+| Scalar-argument buffer reuse pool | Supported | Small scalar/array-size constant `MTLBuffer`s are pooled by byte size and reused across dispatches instead of allocated fresh every launch; a buffer only re-enters the pool once `metal.synchronize()` confirms the command buffer that last used it has completed with no error -- see docs/architecture.md |
+| `metal.batch()` | Supported | Encodes multiple kernel launches onto one shared `MTLCommandBuffer`, committed once as a single tracked submission when the `with` block exits, instead of one command buffer per launch. Not nestable; an exception inside the block discards the batch's uncommitted work entirely. See docs/architecture.md |
 | `NUMBA_METAL_DUMP_MSL=1` / `metal.config.dump_msl` | Supported | |
-| Command-buffer failure propagation | Supported | Every submitted command buffer is tracked through completion; a GPU-side Metal error on any of them is raised (not silently discarded) at the next `synchronize()`/`copy_to_host()`/`copy_to_device()` call |
-| Streams / multiple command queues / events | Unsupported | Single process-wide serial command queue |
+| Command-buffer failure propagation | Supported | Every submitted command buffer is tracked through completion; a GPU-side Metal error on any of them is raised (not silently discarded) at the next `synchronize()`/`copy_to_host()`/`copy_to_device()` call. For a `metal.batch()` submission, a failure is attributed to the whole batch (naming every kernel encoded onto it), since Metal reports one status/error per command buffer, not per individual dispatch within it |
+| Streams / multiple command queues / events | Unsupported | Single process-wide serial command queue (`metal.batch()` reduces per-launch submission overhead within that one queue, but does not provide concurrent/overlapping execution across independent command queues) |
 | Device functions (`@metal.device_func`) | Supported | See "Python syntax" above |
 | `@vectorize` / ufunc support | Planned | See `docs/roadmap.md` Phase 3 |
 

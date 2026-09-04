@@ -167,8 +167,21 @@ class KernelDispatcher:
     ) -> None:
         import Metal
 
+        from numba_metal.runtime.context import current_batch
+
         ctx = get_context()
-        cmdbuf = ctx.queue.commandBuffer()
+        batch = current_batch()
+        # Inside a `metal.batch()` block, every launch on this thread
+        # encodes onto the SAME shared command buffer (committed once,
+        # as a single SubmissionRecord, when the batch ends) instead of
+        # each launch getting its own command buffer committed
+        # immediately -- see context.py's `_BatchState`/`begin_batch`/
+        # `end_batch`. Outside a batch, `cmdbuf` is a brand-new command
+        # buffer as before, committed at the end of this method exactly
+        # like every previous numba-metal release.
+        cmdbuf = (
+            batch.command_buffer if batch is not None else ctx.queue.commandBuffer()
+        )
         encoder = cmdbuf.computeCommandEncoder()
         encoder.setComputePipelineState_(compiled.pipeline_state)
 
@@ -184,6 +197,17 @@ class KernelDispatcher:
         # nothing to let a caller observe *when* or *whether* the work
         # actually completed successfully.
         resources: list[object] = [compiled.pipeline_state]
+        # Scalar-argument and array-size constant buffers acquired from
+        # (or, on a pool miss, freshly allocated for) `ctx`'s process
+        # -wide scalar-buffer pool -- see runtime/context.py's
+        # `acquire_scalar_buffer`/`_release_scalar_buffers`. Recorded
+        # here as `(byte_size, buffer)` pairs and handed to
+        # `register_submission` as `reusable_buffers`, so `synchronize()`
+        # can return them to the pool once THIS submission specifically
+        # is confirmed complete -- never sooner, since Metal has no
+        # notion of "this buffer's contents are no longer needed" short
+        # of the command buffer that reads it actually finishing.
+        reusable_buffers: list[tuple[int, object]] = []
         device = ctx.device
 
         for (kind, name), value in zip(
@@ -194,15 +218,20 @@ class KernelDispatcher:
                 resources.append(dev_array.buffer)
                 encoder.setBuffer_offset_atIndex_(dev_array.buffer, 0, buffer_index)
                 buffer_index += 1
-                size_buf = _scalar_buffer(device, np.uint32(dev_array.size))
+                size_buf = _acquire_scalar_buffer(
+                    ctx, device, np.uint32(dev_array.size)
+                )
                 resources.append(size_buf)
+                reusable_buffers.append((4, size_buf))
                 encoder.setBuffer_offset_atIndex_(size_buf, 0, buffer_index)
                 buffer_index += 1
             else:
                 info = next(s for s in compiled.signature.scalar_params if s[0] == name)
                 np_dtype = _numba_scalar_to_numpy(info[1])
-                scalar_buf = _scalar_buffer(device, np_dtype.type(value))
+                np_scalar = np_dtype.type(value)
+                scalar_buf = _acquire_scalar_buffer(ctx, device, np_scalar)
                 resources.append(scalar_buf)
+                reusable_buffers.append((np_scalar.itemsize, scalar_buf))
                 encoder.setBuffer_offset_atIndex_(scalar_buf, 0, buffer_index)
                 buffer_index += 1
 
@@ -233,17 +262,49 @@ class KernelDispatcher:
         tg_size = Metal.MTLSizeMake(tx, ty, tz)
         encoder.dispatchThreads_threadsPerThreadgroup_(grid_size, tg_size)
         encoder.endEncoding()
+        if batch is not None:
+            # Do not commit or register yet -- accumulate this launch's
+            # resources/reusable buffers/name into the shared batch
+            # state; `end_batch()` (called when the `metal.batch()`
+            # block exits) commits the ONE shared command buffer once
+            # and registers a single SubmissionRecord covering every
+            # launch encoded onto it in this batch.
+            batch.resources.extend(resources)
+            batch.reusable_buffers.extend(reusable_buffers)
+            batch.kernel_names.append(compiled.name)
+            batch.msl_sources.append(compiled.msl_source)
+            return
         cmdbuf.commit()
         ctx.register_submission(
             command_buffer=cmdbuf,
             kernel_name=compiled.name,
             resources=resources,
             msl_source=compiled.msl_source,
+            reusable_buffers=reusable_buffers,
         )
 
 
-def _scalar_buffer(device, np_scalar):
+def _acquire_scalar_buffer(ctx, device, np_scalar):
+    """Return an `MTLBuffer` containing exactly `np_scalar`'s bytes,
+    reusing a same-sized buffer from `ctx`'s process-wide scalar-buffer
+    pool if one is available (writing the new bytes into it via
+    `contents()`, the same mechanism `DeviceNDArray.copy_to_device` uses
+    for ordinary host writes), or allocating a fresh one on a pool miss.
+
+    Safe by construction, not by convention: a buffer only becomes
+    available from the pool after `context.py`'s `synchronize()` has
+    confirmed the command buffer that last used it has completed (see
+    that module's docstring) -- there is no path that returns a buffer
+    to the pool, or hands one out from it, while GPU work could still be
+    reading its old contents.
+    """
     data = np.asarray(np_scalar).tobytes()
+    pooled = ctx.acquire_scalar_buffer(len(data))
+    if pooled is not None:
+        ptr = pooled.contents()
+        raw = ptr.as_buffer(len(data))
+        raw[: len(data)] = data
+        return pooled
     buf = device.newBufferWithBytes_length_options_(data, len(data), 0)
     if buf is None:
         raise KernelLaunchError("Failed to allocate a scalar argument buffer.")

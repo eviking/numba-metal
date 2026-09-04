@@ -409,6 +409,94 @@ narrowing, produced two byte-identical MSL function bodies under
 different names) -- documented in `docs/limitations.md` and
 `docs/roadmap.md` rather than silently left unmentioned.
 
+### 6. Scalar-buffer reuse pool
+
+Every kernel launch synthesizes a small constant `MTLBuffer` for each
+scalar argument and for each array argument's element count (the
+`_size` companion buffer every array parameter gets -- see
+`_emit_signature`). The original MVP allocated a fresh
+`newBufferWithBytes_length_options_` buffer for every one of these on
+every single dispatch, even for a kernel launched repeatedly in a tight
+loop with the same argument *shapes* (only the values differ).
+
+`_MetalContext` (`runtime/context.py`) now owns a process-wide pool,
+keyed by byte size: `acquire_scalar_buffer(byte_size)` pops an
+available buffer of that exact size (or returns `None` on a miss, in
+which case the caller allocates fresh as before). `dispatcher.py`'s
+`_acquire_scalar_buffer` writes the new scalar's bytes into a pooled
+buffer via `contents()` (the same mechanism `DeviceNDArray.
+copy_to_device` already uses for ordinary host writes) rather than
+allocating a new buffer.
+
+A buffer only re-enters the pool from `synchronize()`, and only for a
+submission that completed without error (`SubmissionRecord.
+reusable_buffers`, populated by `dispatcher.py` and drained by
+`synchronize()`) -- this is the same "wait before touching shared
+GPU-visible memory" discipline the project already uses for host reads/
+writes (see "Host/device synchronization model" above), applied here to
+buffer *recycling* instead of host access: reuse never races an
+in-flight kernel that might still be reading the buffer's old contents,
+because the only path that makes a buffer available again already
+proved no outstanding command buffer references it. Buffers touched by
+a *failed* submission are deliberately never returned to the pool
+(dropped/garbage-collected normally) rather than risked in a future
+dispatch, since a failure leaves the buffer's true state ambiguous.
+
+Verified directly: repeated launches of the same kernel with varying
+scalar argument values, both synchronized between each launch and
+fired back-to-back with no synchronization at all, produce correct,
+independent results every time, and the pool's total size stabilizes
+(rather than growing per launch) once every distinct byte-size the
+kernel needs has been pooled once -- see
+`tests/integration/test_buffer_reuse_and_batching.py`.
+
+### 7. Command-buffer batching (`metal.batch()`)
+
+Every kernel launch previously created, encoded, and committed its own
+`MTLCommandBuffer` -- correct, but with real per-submission overhead
+(command-buffer allocation, encoder creation, `commit()`) when a caller
+intends several launches to run as one pipeline stage (e.g. three
+kernels forming a fixed compute pipeline, always launched together).
+
+`metal.batch()` (`metal.py`, backed by `runtime/context.py`'s
+`_BatchState`/`begin_batch`/`end_batch`) is a thread-local context
+manager: entering it allocates ONE `MTLCommandBuffer` and stashes it in
+a `threading.local`; every launch on that thread for the duration of the
+`with` block checks `current_batch()` in `dispatcher.py`'s `_dispatch`
+and, if set, encodes onto that shared command buffer instead of
+creating and committing its own. Exiting the block normally commits the
+shared buffer once and registers exactly one `SubmissionRecord`
+covering every launch that was encoded onto it (its `resources`/
+`reusable_buffers` are the union of every individual launch's, and its
+`kernel_name` lists every kernel involved, since a Metal command
+buffer's status/error is reported for the whole buffer, not per
+encoded dispatch within it -- a real, documented precision-vs-overhead
+tradeoff of batching, not an oversight).
+
+Thread-local, not process-global, so two threads batching concurrently
+never contend over or interfere with each other's in-progress command
+buffer -- matching the project's existing thread-safety conventions
+(the outstanding-submission registry and scalar-buffer pool are
+lock-protected shared state; a batch's own in-progress command buffer
+is instead kept entirely off that shared state until it commits).
+Nesting `metal.batch()` on the same thread raises `MetalRuntimeError`
+rather than being silently accepted with unclear semantics. If an
+exception propagates out of the `with` block (including from an invalid
+launch partway through building the batch), the batch's command buffer
+is discarded uncommitted via `discard_batch()` -- none of the launches
+encoded so far run, and the thread-local state is cleared so a
+subsequent, unrelated launch on that thread is unaffected.
+
+Verified directly: a 3-stage pipeline batched onto one command buffer
+produces the correct chained result (each stage's kernel correctly
+reads the previous stage's output, confirming in-order execution within
+the one command buffer, not concurrent/out-of-order execution);
+`metal.synchronize()` after a batch reports exactly one outstanding
+submission for however many launches were batched; an exception mid
+-batch leaves zero new outstanding submissions and a normal, working
+state for subsequent launches. See
+`tests/integration/test_buffer_reuse_and_batching.py`.
+
 ## Deliberate precision decisions
 
 - **float64 narrowing.** Python float literals and `/` true-division

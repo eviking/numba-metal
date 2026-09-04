@@ -225,9 +225,26 @@ model to a non-kernel-entry-point function.
 Risk: medium.
 Complexity: medium.
 
+**Command-buffer batching and scalar-buffer reuse** -- done.
+`metal.batch()` encodes multiple launches onto one shared command
+buffer (one commit, one tracked `SubmissionRecord`, instead of one per
+launch); small scalar-argument/array-size constant buffers are pooled
+by byte size and reused across dispatches once `synchronize()` confirms
+the previous user's command buffer completed, instead of allocating a
+fresh `MTLBuffer` every single launch. Not yet done: automatic/implicit
+batching (today `metal.batch()` is an explicit opt-in context manager,
+not applied by default), and reuse of the larger per-array device
+buffers themselves (only the small scalar/size constant buffers are
+pooled; `DeviceNDArray`'s own backing buffer is still allocated once
+per `to_device()`/`device_array()` call, which is the correct behavior
+since an array's buffer is user-owned for that array's lifetime, not a
+per-dispatch temporary).
+
 **Streams and events**
 User value: overlapping compute with transfer, concurrent independent
-kernel graphs.
+kernel graphs. Distinct from `metal.batch()` (done, above), which
+reduces per-launch overhead within the existing single serial queue but
+does not provide concurrent/overlapping execution.
 Dependency: exposing `MTLCommandQueue`/`MTLEvent` beyond the current
 single process-wide serial queue (`numba_metal/runtime/context.py`).
 Risk: medium -- concurrency bugs (race conditions in buffer reuse across
