@@ -1828,8 +1828,24 @@ class MSLKernelLowerer:
             # as `_emit_assign` already does for `ir.Const` via
             # `_const_text`, so a global constant behaves identically to
             # writing the literal inline.
+            #
+            # This check also has to accept numpy scalar types
+            # (np.float32/np.int32/np.bool_/...), not just Python's own
+            # bool/int/float -- numpy scalars are NOT subclasses of the
+            # builtins (`isinstance(np.float32(1.0), float)` is False),
+            # so a module-level constant declared with an explicit numpy
+            # dtype (the idiomatic way to pin a physical constant to
+            # float32 for a kernel, e.g. `SIGMA = np.float32(5.67e-8)`)
+            # used to fall straight through this branch to the
+            # `_ident(name)` case below, referencing an SSA name that was
+            # never declared -- reading uninitialized MSL stack memory at
+            # runtime (observed directly: silently 0.0 in one kernel,
+            # NaN in another, depending on what garbage happened to be on
+            # the stack). `_const_text` itself normalizes numpy scalars
+            # to plain Python values, so it's the single source of truth
+            # for "is this a constant-like value" here too.
             value = self._globals[name]
-            if isinstance(value, (bool, int, float)):
+            if isinstance(value, (bool, int, float, np.bool_, np.integer, np.floating)):
                 return self._const_text(value, name)
         if name in self.typemap:
             return self._ident(name)
@@ -1950,6 +1966,28 @@ class MSLKernelLowerer:
         self.builder.write(f"{ident}_0 = {tmp};")
 
     def _const_text(self, py_val, target_name: str) -> str:
+        # A module-level global declared with an explicit numpy scalar
+        # type (e.g. `STEFAN_BOLTZMANN = np.float32(5.67e-8)`, the
+        # idiomatic way to pin a physical constant's dtype) arrives here
+        # as a `numpy.float32`/`numpy.int32`/`numpy.bool_` instance, none
+        # of which are subclasses of Python's own `bool`/`int`/`float` --
+        # every isinstance check below would silently miss it and fall
+        # through to the UnsupportedFeatureError at the bottom, EXCEPT
+        # that (found the hard way, via a NaN in a kernel using exactly
+        # this pattern) this function is also reached from `_read()`'s
+        # global-constant path, which does its own narrower isinstance
+        # check before ever calling here -- so a numpy-scalar global was
+        # actually falling through *there* to an unassigned/undeclared
+        # variable reference, reading uninitialized MSL stack memory
+        # (observed as 0.0 or NaN depending on luck), never even reaching
+        # this function or its error path. Normalizing numpy scalars to
+        # plain Python values up front fixes both call sites at once.
+        if isinstance(py_val, np.bool_):
+            py_val = bool(py_val)
+        elif isinstance(py_val, np.integer):
+            py_val = int(py_val)
+        elif isinstance(py_val, np.floating):
+            py_val = float(py_val)
         if isinstance(py_val, bool):
             return "true" if py_val else "false"
         if isinstance(py_val, int):

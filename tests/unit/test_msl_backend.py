@@ -5,6 +5,9 @@ any machine with Numba installed (no Metal device required).
 
 from __future__ import annotations
 
+import re
+
+import numpy as np
 import pytest
 from numba.core import types
 
@@ -167,3 +170,65 @@ def test_generated_kernel_name_is_deterministic_per_call() -> None:
     src2 = _lower(f, sig)
     assert "kernel void test_kernel(" in src1
     assert "kernel void test_kernel(" in src2
+
+
+# A module-level global declared with an explicit numpy scalar type
+# (e.g. `SIGMA = np.float32(5.67e-8)`) is the idiomatic way to pin a
+# physical constant's dtype for a kernel -- and numpy scalar types are
+# NOT subclasses of Python's own bool/int/float, so an isinstance check
+# written against only the builtins silently misses them. Found via a
+# real kernel that produced NaN: the constant's SSA name was never
+# declared or assigned (by design -- non-callable globals are meant to
+# be resolved to literal text at every use site instead), and the
+# isinstance check gating that resolution didn't recognize a
+# numpy.float32 value, so the reference fell through to an identifier
+# for a variable that was never declared -- reading whatever garbage
+# happened to be on the MSL kernel's stack at that point.
+_NUMPY_FLOAT_GLOBAL = np.float32(5.67e-8)
+_NUMPY_INT_GLOBAL = np.int32(42)
+_NUMPY_BOOL_GLOBAL = np.bool_(True)
+
+
+def test_numpy_float32_global_constant_is_emitted_as_a_literal() -> None:
+    def f(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = _NUMPY_FLOAT_GLOBAL * a[i]
+
+    sig = (types.float32[::1], types.float32[::1])
+    src = _lower(f, sig)
+    # The multiplication must use the resolved literal value (not
+    # exactly "5.67e-08f" -- float32->Python-float->repr() introduces
+    # harmless extra digits, e.g. "5.669999936230852e-08f" -- so check
+    # numeric value instead of exact text), and the final assignment to
+    # `arg_out` must not read the bare, never-assigned temporary the
+    # global load declared (the actual shape of the bug: `arg_out[v_i]
+    # = v__58load_global_0;`, referencing an SSA name with no
+    # initializer anywhere in the function).
+    match = re.search(r"([0-9.eE+-]+)f\s*\*", src)
+    assert match is not None, f"no float literal multiplication found in:\n{src}"
+    assert abs(float(match.group(1)) - 5.67e-8) < 1e-15
+    assign_line = next(line for line in src.splitlines() if "arg_out[v_i] =" in line)
+    assert "load_global" not in assign_line
+
+
+def test_numpy_int32_global_constant_is_emitted_as_a_literal() -> None:
+    def f(a, out, n):
+        i = metal.grid(1)
+        if i < n + _NUMPY_INT_GLOBAL:
+            out[i] = a[i]
+
+    sig = (types.float32[::1], types.float32[::1], types.int64)
+    src = _lower(f, sig)
+    assert "42" in src
+
+
+def test_numpy_bool_global_constant_is_emitted_as_true_or_false() -> None:
+    def f(a, out):
+        i = metal.grid(1)
+        if _NUMPY_BOOL_GLOBAL and i < out.size:
+            out[i] = a[i]
+
+    sig = (types.float32[::1], types.float32[::1])
+    src = _lower(f, sig)
+    assert "true" in src
