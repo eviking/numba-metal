@@ -209,7 +209,17 @@ def run(
                 lambda: _metal_resident(grid, iterations), warmup=1, repeats=3
             )
             result.metal_resident_pipeline_ns = t_resident.median_ns
-            result.metal_kernel_only_warm_ns = t_resident.median_ns / iterations
+            # `metal_kernel_only_warm_ns` feeds `speedup_vs()`, which divides
+            # a FULL-RUN CPU time (all `iterations` steps) by this value --
+            # so it must also be a full-run time, not a per-iteration one.
+            # This previously divided by `iterations` here, which silently
+            # compared one Metal iteration against `iterations` CPU
+            # iterations and inflated the reported speedup by roughly that
+            # factor (a real bug: the printed "vs Numba(par)" column for
+            # this benchmark was off by ~200x at iterations=200). The
+            # correct per-iteration figure is reported separately below via
+            # `extra["metal_resident_per_iter_ns"]`.
+            result.metal_kernel_only_warm_ns = t_resident.median_ns
             result.metal_end_to_end_warm_ns = t_resident.median_ns
             gpu_resident = _metal_resident(grid, iterations)
             gpu_ok, gpu_note = assert_allclose(
