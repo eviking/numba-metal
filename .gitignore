@@ -14,6 +14,10 @@ __MACOSX/
 *.nbc
 *.nbi
 
+# Default output directory for `numba-metal advisor profile/compare`
+# when run without --output.
+numba-metal-profile-*/
+
 # Large generated evidence artifacts: kept locally for inspection, not
 # committed. See artifacts/README.md.
 artifacts/differential/*.json
