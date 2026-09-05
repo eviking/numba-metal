@@ -437,10 +437,37 @@ class Structurer:
         the "taken" side of nested ifs is not needed here -- instead we
         find the first label reachable from true_t that is also reachable
         from false_t by scanning dominance sets.
+
+        `true_t` itself is never a valid merge candidate, even when it
+        appears in both reachability sets (`false_t` legitimately can be
+        the merge -- that's exactly the one-sided-if shape, `branch cond,
+        true_t, merge`, where the false edge has no body of its own and
+        goes straight to the real continuation). This distinction matters
+        for conditions built from `or`/`and` (e.g. `if (v3 or v3):`),
+        which Numba lowers as a chain of re-tests of the same boolean
+        where the false-arm's own re-test block jumps *directly into* the
+        true branch's block (rather than into a separate, later merge
+        block) -- so the true branch's own block ends up "reachable from"
+        the false arm too, and naively picking the reachable label with
+        the fewest dominators can select that in-progress arm block
+        itself instead of the real, later reconvergence point.
+        Concretely: for `branch v, 112, 98` where block 98 itself branches
+        to `112 or 116`, block 112 is reachable from both starts (it IS
+        true_t, and it's also directly reachable from false_t=98), and
+        had exactly as few dominators as the real merge (116) -- so
+        `min()` non-deterministically picked 112, producing an if-node
+        whose "merge" was actually still inside the true arm's own body.
+        The caller then continued structuring from that bogus merge
+        point, re-entering blocks already covered by the true arm and
+        eventually re-visiting a loop header a second time ("irreducible
+        control flow" false positive). Excluding only true_t (not
+        false_t) from candidacy fixes this case while preserving the
+        legitimate one-sided-if shape, where false_t genuinely is the
+        correct merge and must remain a valid candidate.
         """
         true_reach = self._reachable_without_loop_back(true_t)
         false_reach = self._reachable_without_loop_back(false_t)
-        common = true_reach & false_reach
+        common = (true_reach & false_reach) - {true_t}
         if not common:
             return None
         # The merge point is the common label with the fewest dominators
