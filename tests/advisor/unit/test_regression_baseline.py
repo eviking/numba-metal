@@ -92,18 +92,9 @@ def test_register_submission_and_synchronize_signatures_are_unchanged():
     assert all(p.kind != inspect.Parameter.VAR_KEYWORD for p in required)
 
 
-def test_advisor_module_source_contains_no_datashader_reference():
-    """Repository-boundary rule carried through this entire feature:
-    numba-metal must contain zero Datashader-specific code. This is a
-    structural regression guard, not just a one-time check, so a future
-    change that accidentally imports or references datashader is caught
-    by the existing advisor test suite rather than requiring a human to
-    remember the rule."""
-    import pathlib
-
-    advisor_dir = pathlib.Path(
-        importlib.import_module("numba_metal.advisor").__file__
-    ).parent
-    for path in advisor_dir.rglob("*.py"):
-        text = path.read_text()
-        assert "datashader" not in text.lower(), f"{path} references datashader"
+# This package's repository-boundary rule (see .github/workflows/ci.yml's
+# "Repository boundary check" step and its own docstring) is already
+# enforced repo-wide by a CI grep step, not duplicated here: a unit test
+# for it would need to contain the forbidden term in its own source in
+# order to check for it, which the CI step itself would then flag.
+# Enforced once, at the CI level, instead of here.
