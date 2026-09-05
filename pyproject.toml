@@ -40,10 +40,20 @@ dev = [
 image = [
     "pillow>=10.0",
 ]
+tui = [
+    # Interactive `numba-metal advisor` terminal UI only (advisor/tui.py).
+    # Not required for scan/report/non-interactive profile/compare, which
+    # never import this module -- see docs/advisor.md's "Privacy and
+    # local-only operation" / interactive-UI section.
+    "blessed>=1.20",
+]
 
 [project.urls]
 Homepage = "https://github.com/numba-metal/numba-metal"
 Issues = "https://github.com/numba-metal/numba-metal/issues"
+
+[project.scripts]
+numba-metal = "numba_metal.advisor.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

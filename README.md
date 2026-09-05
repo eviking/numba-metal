@@ -88,6 +88,32 @@ No speedup numbers are hard-coded anywhere in this repository; every
 number reported by these scripts is measured on the machine you run them
 on.
 
+## Find the Python worth putting on the Metal
+
+The `numba-metal advisor` CLI answers "which of my functions would
+actually benefit from this?" -- as a terminal-only static scanner and
+profiler, never a browser or notebook UI.
+
+```bash
+numba-metal advisor scan .                           # find candidates, runs nothing
+numba-metal advisor compare my_workload.py            # measure CPU vs. Metal, with correctness checks
+```
+
+```
+[HIGH POTENTIAL] mandelbrot.py:97 _make_metal_kernel.<locals>.metal_kernel
+Why:
+  - Already running on numba-metal (@metal.jit)
+
+Recommendation (USE_METAL): measured 15.38x faster (steady_state), and
+results match the CPU reference within tolerance.
+```
+
+Static analysis never claims a speedup by itself -- only `compare`,
+which actually runs your code and checks correctness first, can say
+that. See `docs/advisor.md` for the full command reference, how
+compatibility and opportunity scoring work, and how to read the ASCII
+flame graphs and CPU/GPU timeline.
+
 ## Safety and correctness caveats
 
 - **No silent fallback.** If a kernel uses an unsupported Python

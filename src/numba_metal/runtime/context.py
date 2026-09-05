@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +56,16 @@ from numba_metal.runtime.device import check_capable
 _MTL_COMMAND_BUFFER_STATUS_ERROR = 5
 
 _sequence_counter = itertools.count(1)
+
+# Optional profiling hooks, installed by numba_metal.advisor.profiler.
+# Empty by default -- normal execution never calls into these lists, so
+# there is no cost when profiling is not active beyond the two `if`
+# checks below (see advisor/metal_events.py's module docstring and
+# docs/advisor.md's "How to add new instrumentation events" for the
+# full hook contract). Nothing here changes register_submission's or
+# synchronize's existing behavior or return value.
+_submission_hooks: list[Any] = []
+_sync_hooks: list[Any] = []
 
 
 @dataclass
@@ -186,6 +197,9 @@ class _MetalContext:
         )
         with self._outstanding_lock:
             self._outstanding.append(record)
+        if _submission_hooks:
+            for hook in _submission_hooks:
+                hook(record)
         return record
 
     def acquire_scalar_buffer(self, byte_size: int):
@@ -234,6 +248,13 @@ class _MetalContext:
             pending = list(self._outstanding)
             self._outstanding.clear()
 
+        # Timed unconditionally (one cheap monotonic-clock pair) so a
+        # profiling hook installed mid-call still sees a start time; the
+        # sync_start/sync_duration values are only ever consumed if
+        # _sync_hooks is non-empty (see the hook-firing block below,
+        # reached only on the success path -- matching this method's
+        # existing raise-or-return contract exactly).
+        sync_start_ns = time.monotonic_ns()
         failures: list[tuple[SubmissionRecord, Any]] = []
         reclaimed_buffers: list[tuple[int, Any]] = []
         for record in pending:
@@ -250,6 +271,10 @@ class _MetalContext:
                 # (garbage-collected normally) rather than risked in a
                 # future dispatch.
                 reclaimed_buffers.extend(record.reusable_buffers)
+        sync_duration_ns = time.monotonic_ns() - sync_start_ns
+        if _sync_hooks and pending:
+            for hook in _sync_hooks:
+                hook(sync_start_ns, sync_duration_ns, len(pending))
 
         if reclaimed_buffers:
             self._release_scalar_buffers(reclaimed_buffers)
@@ -291,6 +316,30 @@ _context = _MetalContext()
 def get_context() -> _MetalContext:
     """Return the process-wide Metal context, initializing it if needed."""
     return _context
+
+
+def add_submission_hook(hook) -> None:
+    """Register a callable invoked with the `SubmissionRecord` every time
+    `register_submission` is called (i.e. once per kernel launch, or once
+    per `metal.batch()` block). Intended for `numba_metal.advisor`'s
+    profiler; empty by default and never invoked unless something has
+    called this. See module docstring's "_submission_hooks" note."""
+    _submission_hooks.append(hook)
+
+
+def add_sync_hook(hook) -> None:
+    """Register a callable invoked as `hook(start_ns, duration_ns,
+    pending_count)` every time `synchronize()` waits on at least one
+    outstanding command buffer. Intended for `numba_metal.advisor`'s
+    profiler; empty by default."""
+    _sync_hooks.append(hook)
+
+
+def clear_hooks() -> None:
+    """Remove every registered submission/sync hook. Intended for
+    `numba_metal.advisor.profiler.deactivate()`."""
+    _submission_hooks.clear()
+    _sync_hooks.clear()
 
 
 class _BatchState:
