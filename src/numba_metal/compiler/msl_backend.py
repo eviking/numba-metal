@@ -433,8 +433,10 @@ class MSLKernelLowerer:
         for name, ty in zip(self.typed.arg_names, self.typed.arg_types, strict=True):
             if isinstance(ty, nb_types.Array):
                 if ty.ndim != 1:
-                    kind = "@metal.device_func argument" if self.device_function else (
-                        "Kernel argument"
+                    kind = (
+                        "@metal.device_func argument"
+                        if self.device_function
+                        else ("Kernel argument")
                     )
                     raise UnsupportedFeatureError(
                         f"{kind} {name!r} has {ty.ndim} dimensions; "
