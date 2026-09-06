@@ -73,14 +73,26 @@ indexing, and a documented subset of `abs`/`min`/`max`/`math.sqrt`/
 
 ## Benchmarks
 
-Five benchmark programs (`benchmarks/*.py`) compare plain Python, NumPy,
+**[View the benchmark report](docs/benchmark-report.html)** — a plain-language
+walkthrough of what each benchmark actually computes, side-by-side timings
+against NumPy and Numba, and honest wins/losses (open the file directly in a
+browser, or view it rendered on GitHub via
+[htmlpreview](https://htmlpreview.github.io/?https://github.com/eviking/numba-metal/blob/main/docs/benchmark-report.html)).
+
+Eight benchmark programs (`benchmarks/*.py`) compare plain Python, NumPy,
 Numba CPU (`@njit`), and numba-metal, at multiple problem sizes, with
-correctness checks and cold/warm/transfer-inclusive timing:
+correctness checks and cold/warm/transfer-inclusive timing. Five are wired
+into one runner; the rest (cyclist aerodynamics, implied volatility, Asian
+option pricing) measure their own CPU-vs-Metal comparison directly since
+they don't share `run_all.py`'s shape:
 
 ```bash
-python benchmarks/run_all.py            # text report
+python benchmarks/run_all.py            # text report (5 core benchmarks)
 python benchmarks/run_all.py --json out.json   # + machine-readable JSON
 python benchmarks/run_all.py --quick    # smaller sizes, for a fast check
+python benchmarks/cyclist_aerodynamics.py
+python benchmarks/implied_volatility.py
+python benchmarks/asian_option_pricing.py
 ```
 
 See `docs/benchmarking.md` for methodology and how to interpret results.
