@@ -44,19 +44,27 @@ class CompiledKernel:
     max_threads_per_threadgroup: int
 
 
-def _cache_key(func, arg_types, device_registry_id: int) -> str:
+def _source_digest(func) -> str:
+    """`inspect.getsource(func)` reads and re-parses the defining source
+    file from disk every time it's called -- fine for a one-off cache
+    miss, but measured directly (this project's dispatch-overhead
+    investigation) to cost ~22us on its own, which is ~15% of an entire
+    warm kernel launch's ~150us total time if recomputed on every single
+    dispatch. `func` itself never changes between dispatches of the same
+    `KernelDispatcher` (see `dispatcher.py`'s `self._cache =
+    KernelCache()`, one cache per dispatcher instance, always called
+    with `self.py_func`), so `get_or_compile` memoizes this specific
+    piece by `id(func)` instead of recomputing it on every warm call."""
     try:
         source = inspect.getsource(func)
     except (OSError, TypeError):
         source = repr(func)
-    payload = "|".join(
-        [
-            source,
-            repr(func.__qualname__),
-            repr(arg_types),
-            str(device_registry_id),
-        ]
-    )
+    payload = "|".join([source, repr(func.__qualname__)])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_key(source_digest: str, arg_types, device_registry_id: int) -> str:
+    payload = "|".join([source_digest, repr(arg_types), str(device_registry_id)])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -71,6 +79,13 @@ class KernelCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[str, CompiledKernel] = {}
+        # (id(func) -> (func, source_digest)): keeps `func` alive so a
+        # garbage-collected-then-reused id can never alias a stale
+        # digest, and avoids re-deriving the digest (inspect.getsource +
+        # hash) on every dispatch when `func` is unchanged -- see
+        # `_source_digest`'s docstring for the measured cost this
+        # avoids.
+        self._source_digests: dict[int, tuple[object, str]] = {}
 
     def get_or_compile(
         self, func, arg_types: tuple[nb_types.Type, ...]
@@ -80,7 +95,15 @@ class KernelCache:
         shader compilation) on a cache miss."""
         ctx = get_context()
         device_id = ctx.info.registry_id
-        key = _cache_key(func, arg_types, device_id)
+
+        cached = self._source_digests.get(id(func))
+        if cached is not None and cached[0] is func:
+            digest = cached[1]
+        else:
+            digest = _source_digest(func)
+            self._source_digests[id(func)] = (func, digest)
+
+        key = _cache_key(digest, arg_types, device_id)
         with self._lock:
             hit = self._entries.get(key)
         if hit is not None:
@@ -95,6 +118,7 @@ class KernelCache:
         """Discard all cached compiled kernels."""
         with self._lock:
             self._entries.clear()
+            self._source_digests.clear()
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -151,6 +175,7 @@ def _compile_kernel(func, arg_types: tuple[nb_types.Type, ...]) -> CompiledKerne
             f"Metal library compiled but function {kernel_name!r} was not "
             "found in it (internal numba-metal codegen error)."
         )
+
     pipeline_state, perr = device.newComputePipelineStateWithFunction_error_(
         function, None
     )

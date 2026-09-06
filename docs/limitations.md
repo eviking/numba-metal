@@ -52,9 +52,39 @@ gap, not evidence it works.
   the kernel body is unsupported -- use `math.sqrt(x)` instead, from the
   small supported subset in `docs/supported-features.md`).
 - No broadcasting.
-- No multidimensional (`ndim > 1`) arrays as kernel arguments; flatten
-  first and do index arithmetic manually (as `heat_diffusion.py` and
-  `pairwise_distance.py` do).
+- 2D and 3D arrays ARE supported as kernel arguments (`arr[x, y]`/
+  `arr[x, y, z]` indexing with a matching `metal.grid(2)`/`metal.grid(3)`
+  launch -- see `tests/integration/test_multidim_arrays.py` and
+  `benchmarks/heat_diffusion.py`). 4D and beyond are not; flatten those
+  manually. `@metal.device_func` arguments remain 1D-only regardless of
+  what the calling kernel uses (a device function's array argument has no
+  `_dimN` companion parameters of its own -- see `msl_backend.py`'s
+  `_classify_params`), and there is no `.shape` attribute access inside a
+  kernel body (only `.size`, the total flattened element count) -- read a
+  dimension's size from a separately-passed scalar argument if a kernel
+  needs it directly. Manual index-flattening (`arr[x*n+y]`) still works
+  and remains necessary for 4D+ data, but was found, directly measured, to
+  meaningfully slow down BOTH Numba's own CPU codegen and Metal's
+  performance relative to real multi-dimensional indexing at the same
+  problem -- see `docs/performance-guidance.md`'s bandwidth-bound section
+  for the measured effect size before choosing to flatten by hand when 2D/
+  3D support already covers the case.
+- **No negative-index wraparound, on any array dimensionality.** Real
+  Numba (CPU) implements Python/NumPy's `a[-1]` meaning "last element"
+  with real runtime wraparound arithmetic (see
+  `numba/np/arrayobj.py`'s `fix_integer_index`) -- numba-metal's MSL
+  codegen does not, and never has, for 1D arrays either; this was only
+  found by comparing against Numba's own reference implementation while
+  building 2D/3D support. A LITERAL negative index (`a[-1]`, `a[-1, 0]`)
+  is now rejected at compile time with `UnsupportedFeatureError` rather
+  than silently reading/writing an out-of-bounds offset (see
+  `tests/test_unsupported.py`'s `test_negative_literal_index_rejected*`
+  tests). A runtime-VARIABLE index that happens to go negative
+  (`a[x - 1]` where `x` can be 0) cannot be checked this way -- MSL has
+  no bounds checking, and this backend has no general bounds-checking
+  machinery of its own for any array access -- and remains silent,
+  undefined out-of-bounds behavior, same as any other
+  out-of-range index in this project.
 
 ## Type restrictions
 

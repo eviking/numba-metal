@@ -148,14 +148,18 @@ def test_unsupported_float64_array_arg_raises() -> None:
         _lower(f, sig)
 
 
-def test_unsupported_2d_array_arg_raises() -> None:
+def test_unsupported_5d_array_arg_raises() -> None:
+    """2D/3D array kernel arguments are supported (see
+    tests/integration/test_multidim_arrays.py); beyond 3D remains
+    unsupported."""
+
     def f(a, out):
         i = metal.grid(1)
         if i < out.size:
-            out[i] = a[i, 0]
+            out[i] = a[i, i, i, i, i]
 
-    sig = (types.float32[:, ::1], types.float32[::1])
-    with pytest.raises(UnsupportedFeatureError, match="1D|dimension"):
+    sig = (types.float32[:, :, :, :, ::1], types.float32[::1])
+    with pytest.raises(UnsupportedFeatureError, match="1D, 2D, or 3D|dimension"):
         _lower(f, sig)
 
 

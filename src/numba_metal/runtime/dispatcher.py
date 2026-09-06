@@ -32,12 +32,23 @@ _PY_SCALAR_TO_NUMBA = {
 }
 
 
+#: numba-metal supports 1D, 2D, and 3D device-array kernel arguments,
+#: matching the ndim range already accepted by the position intrinsics
+#: (metal.grid(ndim), metal.thread_in_threadgroup(ndim), etc.) -- see
+#: msl_backend.py's `_classify_params`/`_emit_signature` for the
+#: corresponding MSL-side flattened-indexing codegen, and
+#: `runtime/array.py`'s `DeviceNDArray` (already shape-agnostic; this
+#: was always the only real restriction) for why no runtime-array
+#: change was needed to support this.
+_MAX_ARRAY_NDIM = 3
+
+
 def _infer_arg_type(value) -> nb_types.Type:
     if isinstance(value, DeviceNDArray):
-        if value.ndim != 1:
+        if value.ndim < 1 or value.ndim > _MAX_ARRAY_NDIM:
             raise KernelLaunchError(
-                f"Kernel arguments must be 1D device arrays in this MVP; "
-                f"got shape {value.shape}."
+                f"Kernel arguments must be 1D, 2D, or 3D device arrays; "
+                f"got shape {value.shape} ({value.ndim}D)."
             )
         try:
             scalar = _SCALAR_NUMPY_TO_NUMBA[value.dtype]
@@ -45,7 +56,11 @@ def _infer_arg_type(value) -> nb_types.Type:
             raise KernelLaunchError(
                 f"Unsupported device array dtype {value.dtype!r}."
             ) from exc
-        return scalar[::1]
+        if value.ndim == 1:
+            return scalar[::1]
+        if value.ndim == 2:
+            return scalar[:, ::1]
+        return scalar[:, :, ::1]
     if isinstance(value, np.generic):
         try:
             return _SCALAR_NUMPY_TO_NUMBA[np.dtype(type(value))]
@@ -225,6 +240,20 @@ class KernelDispatcher:
                 reusable_buffers.append((4, size_buf))
                 encoder.setBuffer_offset_atIndex_(size_buf, 0, buffer_index)
                 buffer_index += 1
+                # For ndim>1 arrays, bind one additional scalar buffer per
+                # TRAILING dimension size (shape[1], shape[2], ... --
+                # never shape[0], which a row-major flat-offset
+                # computation never needs: flat = i0*shape[1]*shape[2]
+                # + i1*shape[2] + i2 for 3D, or i0*shape[1] + i1 for 2D).
+                # Order and count must exactly match
+                # msl_backend.py's `_emit_signature`, which binds these
+                # at the same buffer indices right after `_size`.
+                for dim_size in dev_array.shape[1:]:
+                    dim_buf = _acquire_scalar_buffer(ctx, device, np.uint32(dim_size))
+                    resources.append(dim_buf)
+                    reusable_buffers.append((4, dim_buf))
+                    encoder.setBuffer_offset_atIndex_(dim_buf, 0, buffer_index)
+                    buffer_index += 1
             else:
                 info = next(s for s in compiled.signature.scalar_params if s[0] == name)
                 np_dtype = _numba_scalar_to_numpy(info[1])

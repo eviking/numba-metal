@@ -70,10 +70,10 @@ def infer_arg_types_from_samples(sample_args: tuple) -> tuple[nb_types.Type, ...
     arg_types: list[nb_types.Type] = []
     for value in sample_args:
         if isinstance(value, np.ndarray):
-            if value.ndim != 1:
+            if value.ndim < 1 or value.ndim > 3:
                 raise SampleTypingError(
                     f"sample array has {value.ndim} dimensions; numba-metal "
-                    "kernels only accept 1D arrays -- flatten it first"
+                    "kernels only accept 1D, 2D, or 3D arrays"
                 )
             scalar = _NUMPY_DTYPE_TO_NUMBA_SCALAR.get(value.dtype)
             if scalar is None:
@@ -81,7 +81,12 @@ def infer_arg_types_from_samples(sample_args: tuple) -> tuple[nb_types.Type, ...
                     f"sample array dtype {value.dtype!r} has no Numba "
                     "scalar type mapping known to the advisor"
                 )
-            arg_types.append(scalar[::1])
+            if value.ndim == 1:
+                arg_types.append(scalar[::1])
+            elif value.ndim == 2:
+                arg_types.append(scalar[:, ::1])
+            else:
+                arg_types.append(scalar[:, :, ::1])
         elif isinstance(value, np.generic):
             scalar = _NUMPY_DTYPE_TO_NUMBA_SCALAR.get(np.dtype(type(value)))
             if scalar is None:

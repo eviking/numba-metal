@@ -64,13 +64,59 @@ def test_float64_array_argument_rejected() -> None:
         _lower(f, (types.float64[::1], types.float64[::1]))
 
 
-def test_two_dimensional_array_argument_rejected() -> None:
+def test_four_dimensional_array_argument_rejected() -> None:
+    """2D and 3D array kernel arguments are supported (see
+    tests/integration/test_multidim_arrays.py); 4D+ remains unsupported
+    -- numba-metal's flattened-index codegen and metal.grid's own ndim
+    range only go up to 3 (matching Metal's own MTLSize dispatch
+    dimensionality limit)."""
+
     def f(a, out):
         i = metal.grid(1)
         if i < out.size:
-            out[i] = a[i, i]
+            out[i] = a[i, i, i, i]
 
-    with pytest.raises(UnsupportedFeatureError, match="1D|dimension"):
+    with pytest.raises(UnsupportedFeatureError, match="1D, 2D, or 3D|dimension"):
+        _lower(f, (types.float32[:, :, :, ::1], types.float32[::1]))
+
+
+def test_negative_literal_index_rejected() -> None:
+    """`a[-1]` (meaning "last element" in Python/NumPy) has no
+    wraparound implementation in numba-metal's MSL codegen -- it used
+    to compile silently and read/write whatever out-of-bounds offset
+    the negative value produced in C-style pointer arithmetic. A
+    literal negative index is statically detectable (unlike a
+    runtime-variable one, e.g. `a[x - 1]`, which may or may not be
+    negative depending on `x` and cannot be checked here), so it is
+    now rejected at compile time instead of silently misbehaving --
+    see docs/limitations.md."""
+
+    def f(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = a[-1]
+
+    with pytest.raises(UnsupportedFeatureError, match="[Nn]egative"):
+        _lower(f, (types.float32[::1], types.float32[::1]))
+
+
+def test_negative_literal_index_rejected_setitem() -> None:
+    def f(a, out):
+        i = metal.grid(1)
+        if i == 0:
+            out[-1] = a[0]
+
+    with pytest.raises(UnsupportedFeatureError, match="[Nn]egative"):
+        _lower(f, (types.float32[::1], types.float32[::1]))
+
+
+def test_negative_literal_index_rejected_2d() -> None:
+    def f(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = a[-1, 0]
+
+    with pytest.raises(UnsupportedFeatureError, match="[Nn]egative"):
         _lower(f, (types.float32[:, ::1], types.float32[::1]))
 
 

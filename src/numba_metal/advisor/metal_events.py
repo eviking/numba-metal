@@ -19,14 +19,20 @@ control flow, return value, or exception behavior in any way -- both are
 called AFTER the existing logic has already decided what to do next; see
 `context.py`'s own inline comments at each call site.
 
-Compilation cold/warm timing (`time_compile` below) needed NO change to
-`compiler/pipeline.py` at all: `KernelCache.get_or_compile`'s own hit/miss
+Compilation cold/warm timing (`time_compile` below) needs no NEW hook
+in `compiler/pipeline.py`: `KernelCache.get_or_compile`'s own hit/miss
 branch can be observed from outside by checking `KernelCache._entries`
 under its existing `_lock`, using the exact same cache key
-`_cache_key()` computes -- a documented, minimal, private-API read (no
-mutation), consistent with this repo's own `benchmarks/common.py`
-precedent of reaching into `compiler.pipeline._MSL_PRELUDE`/
-`_next_kernel_name` directly.
+`_cache_key()` computes from `_source_digest()` -- a documented,
+minimal, private-API read (no mutation), consistent with this repo's
+own `benchmarks/common.py` precedent of reaching into
+`compiler.pipeline._MSL_PRELUDE`/`_next_kernel_name` directly. (`
+_cache_key`/`_source_digest`'s split into two functions, and
+`KernelCache._source_digests`'s memoization, were added later to avoid
+re-deriving a kernel's source digest -- an `inspect.getsource()` call
+plus a hash -- on every dispatch; `time_compile` mirrors that same
+memoization here so checking hit/miss never forces the expensive path
+unnecessarily.)
 
 No true GPU-side kernel timestamp exists anywhere in numba-metal (see
 models.GpuTimestampSource's docstring) -- every event this module
@@ -207,12 +213,19 @@ def time_compile(func, arg_types, *, kernel_cache, collector: EventCollector):
     reporting cache hit/miss to `collector`, without modifying
     `KernelCache` itself. See module docstring for why the private
     `_entries`/`_lock`/`_cache_key` read is safe and sufficient."""
-    from numba_metal.compiler.pipeline import _cache_key
+    from numba_metal.compiler.pipeline import _cache_key, _source_digest
     from numba_metal.runtime.context import get_context
 
     ctx = get_context()
     device_id = ctx.info.registry_id
-    key = _cache_key(func, arg_types, device_id)
+    # Mirrors get_or_compile's own digest-memoization (see pipeline.py's
+    # KernelCache._source_digests) so a hit here doesn't force an
+    # otherwise-unnecessary inspect.getsource() just to check hit/miss.
+    cached = kernel_cache._source_digests.get(id(func))
+    digest = (
+        cached[1] if cached is not None and cached[0] is func else _source_digest(func)
+    )
+    key = _cache_key(digest, arg_types, device_id)
     with kernel_cache._lock:
         cache_hit = key in kernel_cache._entries
 

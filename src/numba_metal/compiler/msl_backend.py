@@ -353,6 +353,15 @@ class MSLKernelLowerer:
         self.sig = KernelSignatureInfo()
         self._globals: dict[str, object] = {}
         self._range_calls: dict[str, list[str]] = {}
+        # SSA var name (from a `build_tuple` assignment) -> list of MSL
+        # expressions for each tuple component, in order -- populated by
+        # `_collect_index_tuples` for every `build_tuple` whose result is
+        # used ONLY as a multi-dimensional array index (`arr[x, y]`),
+        # never as a general value. Consumed by `getitem`/`setitem`/
+        # `static_getitem` to compute a row-major flat offset instead of
+        # treating the tuple as an indexable MSL value (which does not
+        # exist for a `build_tuple` result -- see `_flat_index_expr`).
+        self._index_tuples: dict[str, list[str]] = {}
         self._dessa: DeSSAResult | None = None
         self._array_names: set[str] = set()
         self._scalar_names: set[str] = set()
@@ -416,6 +425,7 @@ class MSLKernelLowerer:
         self._collect_special_arrays()
         self._collect_atomic_cas_targets()
         self._collect_range_calls()
+        self._collect_index_tuples()
         entry = min(self.func_ir.blocks.keys())
         structured = structure_function(self.func_ir.blocks, entry)
         self._dessa = DeSSAPass(self.func_ir.blocks).run(structured)
@@ -432,18 +442,33 @@ class MSLKernelLowerer:
     def _classify_params(self) -> None:
         for name, ty in zip(self.typed.arg_names, self.typed.arg_types, strict=True):
             if isinstance(ty, nb_types.Array):
-                if ty.ndim != 1:
+                # Top-level kernels support 1D/2D/3D array arguments
+                # (see dispatcher.py's `_infer_arg_type` and
+                # `_emit_signature` below for the matching runtime
+                # buffer-binding order and MSL `_dimN` parameters this
+                # relies on). `@metal.device_func` arguments remain
+                # restricted to 1D -- a device function takes a plain
+                # `device T*` pointer with no `_size`/`_dimN` companion
+                # buffers of its own (see
+                # `_emit_device_function_signature`), so a multi-dim
+                # array would have no way to carry its shape across a
+                # device-function call boundary; not attempted here.
+                if ty.ndim > 3 or (self.device_function and ty.ndim != 1):
                     kind = (
                         "@metal.device_func argument"
                         if self.device_function
                         else ("Kernel argument")
                     )
+                    detail = (
+                        "1D arrays only"
+                        if self.device_function
+                        else "1D, 2D, or 3D arrays"
+                    )
                     raise UnsupportedFeatureError(
                         f"{kind} {name!r} has {ty.ndim} dimensions; "
-                        "numba-metal only supports 1D arrays as kernel or "
-                        "device-function arguments in this MVP (use "
-                        "flattened indexing for multi-dimensional data -- "
-                        "see docs/limitations.md)."
+                        f"numba-metal only supports {detail} here (use "
+                        "flattened indexing for anything else -- see "
+                        "docs/limitations.md)."
                     )
                 np_dtype = nb_scalar_dtype_to_numpy(ty.dtype)
                 self.sig.array_params.append(ArrayParamInfo(name, np_dtype, ty.ndim))
@@ -484,6 +509,18 @@ class MSLKernelLowerer:
                 buffer_index += 1
                 params.append(f"constant uint& {ident}_size [[buffer({buffer_index})]]")
                 buffer_index += 1
+                # One additional scalar parameter per TRAILING dimension
+                # (shape[1], shape[2], ...) for ndim>1 arrays, used by
+                # getitem/setitem to compute a row-major flat offset for
+                # a tuple index (see `_flat_index_expr`). Binding order
+                # here must exactly match dispatcher.py's `_dispatch`,
+                # which binds these at the same buffer indices
+                # immediately after `_size`.
+                for dim in range(1, info.ndim):
+                    params.append(
+                        f"constant uint& {ident}_dim{dim} [[buffer({buffer_index})]]"
+                    )
+                    buffer_index += 1
             else:
                 _, ty = next(s for s in self.sig.scalar_params if s[0] == name)
                 msl_ty = numba_scalar_to_msl(ty)
@@ -610,6 +647,9 @@ class MSLKernelLowerer:
                 continue
             if name in self._suppressed_names:
                 continue
+            if name in self._index_tuples:
+                continue  # a multi-dim array index tuple; see
+                # _collect_index_tuples/_emit_assign's matching skip.
             if name in self._threadgroup_array_targets:
                 # Already declared as a `threadgroup`-qualified
                 # kernel-function parameter in _emit_signature; MSL does
@@ -874,6 +914,118 @@ class MSLKernelLowerer:
                     self._range_calls[stmt.target.name] = [
                         self._read(a) for a in stmt.value.args
                     ]
+
+    def _collect_index_tuples(self) -> None:
+        """Pre-scan every `build_tuple` assignment (before any MSL
+        emission) and record the ones used as a multi-dimensional array
+        index, so `getitem`/`setitem`/`static_getitem` can look up their
+        component expressions by the tuple SSA var's name regardless of
+        block visitation order. A `build_tuple` used for anything else
+        (e.g. an ordinary tuple literal with no indexing use) is left
+        unrecorded and still hits `_emit_expr_assign`'s existing
+        rejection for general tuple construction -- this method only
+        widens support for the specific, structurally-recognizable
+        `arr[x, y]`/`arr[x, y] = v` shape, matching the project's
+        existing "detect an exact recognized IR shape, reject everything
+        else with a clear error" convention (see `_detect_for_range`).
+        """
+        build_tuple_targets: dict[str, ir.Expr] = {}
+        for block in self.func_ir.blocks.values():
+            for stmt in block.body:
+                if (
+                    isinstance(stmt, ir.Assign)
+                    and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == "build_tuple"
+                ):
+                    build_tuple_targets[stmt.target.name] = stmt.value
+
+        def index_var_name(index) -> str | None:
+            # `getitem`/`SetItem` carry the index as an `ir.Var`;
+            # `static_getitem`/`StaticSetItem` carry it as a plain
+            # constant-folded tuple with a separate `index_var`
+            # attribute pointing at the same `build_tuple` result (used
+            # here only to recognize the shape -- the constant values
+            # themselves are read directly via `stmt.index`, unaffected
+            # by this tuple-index widening).
+            if isinstance(index, ir.Var):
+                return index.name
+            return None
+
+        for block in self.func_ir.blocks.values():
+            for stmt in block.body:
+                index_name = None
+                arr_name = None
+                if isinstance(stmt, ir.SetItem):
+                    index_name = index_var_name(stmt.index)
+                    arr_name = stmt.target.name
+                elif isinstance(stmt, ir.StaticSetItem):
+                    index_name = index_var_name(getattr(stmt, "index_var", None))
+                    arr_name = stmt.target.name
+                elif isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr):
+                    if stmt.value.op == "getitem":
+                        index_name = index_var_name(stmt.value.index)
+                        arr_name = stmt.value.value.name
+                    elif stmt.value.op == "static_getitem":
+                        index_name = index_var_name(
+                            getattr(stmt.value, "index_var", None)
+                        )
+                        arr_name = stmt.value.value.name
+                if index_name is None or index_name not in build_tuple_targets:
+                    continue
+                arr_ty = self.typemap.get(arr_name)
+                if not (isinstance(arr_ty, nb_types.Array) and arr_ty.ndim > 1):
+                    continue
+                tuple_expr = build_tuple_targets[index_name]
+                self._index_tuples[index_name] = [
+                    self._read(item) for item in tuple_expr.items
+                ]
+
+    def _reject_negative_static_index(self, index, arr_name: str) -> None:
+        """Raise a clear compile-time error for a LITERAL negative array
+        index (`a[-1]`, `a[-1, 0]`), the one case of numba-metal's
+        "no negative-index wraparound" limitation (see
+        docs/limitations.md) that is actually detectable without real
+        runtime bounds-checking machinery -- a runtime-variable index
+        (`a[x - 1]`) may or may not be negative depending on `x`, and
+        cannot be checked here; that case remains documented, silent
+        undefined behavior (an out-of-bounds read/write, not a Python
+        -style wraparound), same as before this check existed. `index`
+        is `stmt.index`/`expr.index` from a `StaticSetItem`/
+        `static_getitem` -- a plain Python int for a 1D index, or a
+        tuple of ints for a multi-dimensional one."""
+        components = index if isinstance(index, tuple) else (index,)
+        if any(c < 0 for c in components):
+            raise UnsupportedFeatureError(
+                f"Negative array index {index!r} on {arr_name!r}: "
+                "numba-metal does not implement Python/NumPy's negative "
+                '-index wraparound (`a[-1]` meaning "last element") -- '
+                "see docs/limitations.md. Use a non-negative index "
+                "computed from the array's size instead."
+            )
+
+    def _flat_index_expr(self, arr_name: str, index_name: str) -> str:
+        """The row-major flat-offset MSL expression for a multi-dimensional
+        array index, given the array's own name (to read its `_dimN`
+        companion parameters) and the `build_tuple` SSA var name holding
+        the per-dimension index components (already resolved by
+        `_collect_index_tuples`)."""
+        components = self._index_tuples[index_name]
+        arr_ty = self.typemap[arr_name]
+        ndim = arr_ty.ndim
+        # Standard row-major (C-order) flat offset: for ndim dimensions
+        # with sizes shape[0..ndim-1], flat = sum over d of
+        # (index[d] * product(shape[d+1:])) -- shape[0] never appears in
+        # this formula (a valid index along dimension 0 need not be
+        # bounds-checked against it here; MSL has no bounds checking at
+        # all, matching every other array access in this backend), so
+        # only shape[1:] (the `_dim1`.. companion parameters) are read.
+        terms = []
+        for d in range(ndim):
+            factors = [components[d]]
+            for later_dim in range(d + 1, ndim):
+                factors.append(f"arg_{arr_name}_dim{later_dim}")
+            terms.append("(" + " * ".join(factors) + ")")
+        return " + ".join(terms)
 
     def _compute_suppressed_names(self, node: Node) -> None:
         """Walk the structured tree once, and for every LoopNode that
@@ -1363,13 +1515,22 @@ class MSLKernelLowerer:
             self._emit_assign(stmt)
         elif isinstance(stmt, ir.SetItem):
             target = self._read(stmt.target)
-            index = self._read(stmt.index)
             value = self._read(stmt.value)
+            if stmt.index.name in self._index_tuples:
+                index = self._flat_index_expr(stmt.target.name, stmt.index.name)
+            else:
+                index = self._read(stmt.index)
             self.builder.write(f"{target}[{index}] = {value};")
         elif isinstance(stmt, ir.StaticSetItem):
             target = self._read(stmt.target)
             value = self._read(stmt.value)
-            self.builder.write(f"{target}[{stmt.index}] = {value};")
+            self._reject_negative_static_index(stmt.index, stmt.target.name)
+            index_var = getattr(stmt, "index_var", None)
+            if index_var is not None and index_var.name in self._index_tuples:
+                index = self._flat_index_expr(stmt.target.name, index_var.name)
+            else:
+                index = stmt.index
+            self.builder.write(f"{target}[{index}] = {value};")
         elif isinstance(stmt, ir.Del):
             pass
         else:
@@ -1384,6 +1545,12 @@ class MSLKernelLowerer:
         if target_name in self._suppressed_names:
             return  # pure for-range loop-protocol bookkeeping; see
             # _compute_suppressed_names / _suppress_loop_protocol_names.
+        if target_name in self._index_tuples:
+            return  # a build_tuple recognized as a multi-dimensional
+            # array index (see _collect_index_tuples) -- consumed
+            # directly by the getitem/setitem/static_getitem that uses
+            # it via _flat_index_expr, never materialized as its own
+            # MSL value (there is no MSL tuple type to hold it in).
         if isinstance(value, ir.Arg):
             return  # bound to the MSL parameter identifier already
         if isinstance(value, (ir.Global, ir.FreeVar)):
@@ -1464,9 +1631,12 @@ class MSLKernelLowerer:
         elif op == "cast":
             self._assign(target_name, self._read(expr.value))
         elif op == "getitem":
-            self._assign(
-                target_name, f"{self._read(expr.value)}[{self._read(expr.index)}]"
-            )
+            arr_ident = self._read(expr.value)
+            if expr.index.name in self._index_tuples:
+                index = self._flat_index_expr(expr.value.name, expr.index.name)
+            else:
+                index = self._read(expr.index)
+            self._assign(target_name, f"{arr_ident}[{index}]")
         elif op == "static_getitem":
             cas_pair = self._atomic_cas_results.get(expr.value.name)
             if cas_pair is not None:
@@ -1478,7 +1648,13 @@ class MSLKernelLowerer:
                 # index into here.
                 self._assign(target_name, cas_pair[expr.index])
                 return
-            self._assign(target_name, f"{self._read(expr.value)}[{expr.index}]")
+            self._reject_negative_static_index(expr.index, expr.value.name)
+            index_var = getattr(expr, "index_var", None)
+            if index_var is not None and index_var.name in self._index_tuples:
+                index = self._flat_index_expr(expr.value.name, index_var.name)
+            else:
+                index = expr.index
+            self._assign(target_name, f"{self._read(expr.value)}[{index}]")
         elif op == "getattr":
             if target_name in self._globals:
                 return  # resolved as a callable (e.g. metal.grid); no MSL emitted
