@@ -57,8 +57,10 @@ class CalibrationResult:
     cold_compile_ns: float
     buffer_alloc_ns: float
     sync_overhead_ns: float
-    float32_gflops: float | None
+    float32_gflops_memory_bound: float | None
     memory_bandwidth_gbps: float | None
+    float32_gflops_compute_bound: float | None
+    roofline_ridge_flops_per_byte: float | None
     crossover_elements_estimate: int | None
 
     def to_json_dict(self) -> dict:
@@ -201,14 +203,76 @@ def run_calibration() -> CalibrationResult:
         metal.synchronize()
         throughput_samples.append(time.perf_counter_ns() - t0)
     median_ns = sorted(throughput_samples)[len(throughput_samples) // 2]
-    # 2 flops per element (multiply-add), n_throughput elements.
-    float32_gflops = (
+    # 2 flops per element (multiply-add), n_throughput elements. This
+    # number is named `float32_gflops_memory_bound` (not just
+    # `float32_gflops`) deliberately: `_calib_add` has arithmetic
+    # intensity of only 2 flops / 12 bytes ~= 0.17 flops/byte, far below
+    # this hardware's real roofline ridge point (~3 flops/byte, per the
+    # compute-bound measurement below) -- so this kernel is memory-
+    # bandwidth-bound, and the GFLOPS figure it produces reflects
+    # "throughput achievable when also bandwidth-limited," NOT the
+    # chip's real peak arithmetic rate. Using this number as a general
+    # "compute ceiling" for a compute-bound kernel (high arithmetic
+    # intensity, little memory traffic -- e.g. an escape-time fractal
+    # with many loop iterations per pixel and one write) understates the
+    # real achievable throughput by more than an order of magnitude:
+    # verified directly on this M4 Pro, this kernel measures ~37 GFLOPS
+    # while a genuinely compute-bound kernel (high arithmetic intensity,
+    # ~0.5 bytes/flop) sustains ~680 GFLOPS on the same hardware.
+    float32_gflops_memory_bound = (
         (2.0 * n_throughput) / (median_ns / 1e9) / 1e9 if median_ns > 0 else None
     )
     # 3 arrays of n_throughput float32 touched (2 read + 1 write) per launch.
     bytes_moved = 3 * n_throughput * 4
     memory_bandwidth_gbps = (
         bytes_moved / (median_ns / 1e9) / 1e9 if median_ns > 0 else None
+    )
+
+    # Compute-bound float32 throughput: a kernel with high arithmetic
+    # intensity (many sequential FMA-shaped operations per element, only
+    # one array read and one write per thread total) so memory traffic
+    # is negligible and the measured time reflects the GPU's actual
+    # sustained arithmetic rate instead of bandwidth. `compute_iters` is
+    # large enough that dispatch overhead and the single read/write are
+    # both a small fraction of total time.
+    compute_iters = 10_000
+    n_compute = 4_000_000
+    x_c = np.random.default_rng(4).random(n_compute).astype(np.float32)
+    d_x_c = metal.to_device(x_c)
+    d_out_c = metal.to_device(np.zeros(n_compute, dtype=np.float32))
+    blocks_c = (n_compute + 255) // 256
+
+    @metal.jit
+    def _calib_compute(a, out, iters):
+        i = metal.grid(1)
+        if i < out.size:
+            x = a[i]
+            y = 1.0000001
+            for _ in range(iters):
+                x = x * y + 0.0000001
+            out[i] = x
+
+    for _ in range(3):
+        _calib_compute[blocks_c, 256](d_x_c, d_out_c, compute_iters)
+        metal.synchronize()
+    compute_samples = []
+    for _ in range(10):
+        t0 = time.perf_counter_ns()
+        _calib_compute[blocks_c, 256](d_x_c, d_out_c, compute_iters)
+        metal.synchronize()
+        compute_samples.append(time.perf_counter_ns() - t0)
+    compute_median_ns = sorted(compute_samples)[len(compute_samples) // 2]
+    # 2 flops per loop iteration (multiply + add), n_compute elements,
+    # compute_iters iterations each.
+    float32_gflops_compute_bound = (
+        (2.0 * n_compute * compute_iters) / (compute_median_ns / 1e9) / 1e9
+        if compute_median_ns > 0
+        else None
+    )
+    roofline_ridge_flops_per_byte = (
+        (float32_gflops_compute_bound * 1e9) / (memory_bandwidth_gbps * 1e9)
+        if float32_gflops_compute_bound and memory_bandwidth_gbps
+        else None
     )
 
     try:
@@ -237,7 +301,9 @@ def run_calibration() -> CalibrationResult:
         cold_compile_ns=float(cold_compile_ns),
         buffer_alloc_ns=buffer_alloc_ns,
         sync_overhead_ns=sync_overhead_ns,
-        float32_gflops=float32_gflops,
+        float32_gflops_memory_bound=float32_gflops_memory_bound,
+        float32_gflops_compute_bound=float32_gflops_compute_bound,
+        roofline_ridge_flops_per_byte=roofline_ridge_flops_per_byte,
         memory_bandwidth_gbps=memory_bandwidth_gbps,
         crossover_elements_estimate=None,
     )

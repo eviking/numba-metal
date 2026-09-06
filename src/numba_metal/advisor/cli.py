@@ -477,10 +477,24 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     print(f"Cold compile:           {result.cold_compile_ns/1e6:.2f} ms")
     print(f"Buffer allocation:      {result.buffer_alloc_ns/1000:.1f} us")
     print(f"Synchronization:        {result.sync_overhead_ns/1000:.2f} us")
-    if result.float32_gflops is not None:
-        print(f"float32 throughput:     {result.float32_gflops:.1f} GFLOPS")
     if result.memory_bandwidth_gbps is not None:
         print(f"Memory bandwidth:       {result.memory_bandwidth_gbps:.1f} GB/s")
+    if result.float32_gflops_memory_bound is not None:
+        print(
+            f"float32 (memory-bound): {result.float32_gflops_memory_bound:.1f} GFLOPS "
+            "(a bandwidth-limited kernel's throughput -- NOT peak compute)"
+        )
+    if result.float32_gflops_compute_bound is not None:
+        print(
+            f"float32 (compute-bound):{result.float32_gflops_compute_bound:.1f} GFLOPS "
+            "(high-arithmetic-intensity kernel, negligible memory traffic)"
+        )
+    if result.roofline_ridge_flops_per_byte is not None:
+        print(
+            f"Roofline ridge point:   {result.roofline_ridge_flops_per_byte:.2f} "
+            "FLOPs/byte (above this arithmetic intensity, a kernel is "
+            "compute-bound; below it, memory-bandwidth-bound)"
+        )
     print()
     print(f"Saved to {path}")
     print(

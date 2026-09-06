@@ -477,18 +477,46 @@ CPU/GPU crossover size. Real numbers from an Apple M4 Pro:
 | Cold compile | ~66 ms |
 | Buffer allocation | ~49 us |
 | Sync overhead | ~333 ns |
-| Float32 throughput | ~37 GFLOPS |
 | Memory bandwidth | ~221 GB/s |
+| Float32 (memory-bound) | ~37 GFLOPS |
+| Float32 (compute-bound) | ~683 GFLOPS |
+| Roofline ridge point | ~3.09 FLOPs/byte |
 
-The throughput and bandwidth figures are measured on a 100,000,000-
-element elementwise kernel specifically -- large enough that per-launch
-dispatch overhead (the row above it) is a small fraction of the
-measured time, so the number reflects genuine sustained throughput
-rather than mostly re-measuring dispatch overhead. (An earlier version
-of this calibration reused the same, much smaller problem size as the
-dispatch-overhead measurement for this step too, which understated real
-bandwidth by roughly 4-5x -- ~60 GB/s reported versus ~221 GB/s actually
-achievable at this problem size on the same hardware.)
+There are deliberately **two** float32 throughput numbers, from two
+differently-shaped kernels, because a single number cannot honestly
+answer "how fast is this GPU at arithmetic" -- it depends entirely on
+how much memory traffic accompanies that arithmetic:
+
+- **Memory-bound** is measured on a large elementwise kernel (2 reads +
+  1 write, 2 FLOPs per element -- arithmetic intensity of roughly 0.17
+  FLOPs/byte) at 100,000,000 elements, large enough that per-launch
+  dispatch overhead (the row above it) is a small fraction of the
+  measured time. At this arithmetic intensity the kernel is limited by
+  memory bandwidth, not compute, so the resulting GFLOPS number reflects
+  "arithmetic throughput achievable while also bandwidth-limited" --
+  useful for kernels shaped like this one (a handful of FLOPs per array
+  element touched), but a real, previously-made mistake in this project
+  was using this number as a general "compute ceiling" for kernels of a
+  completely different shape.
+- **Compute-bound** is measured on a kernel with high arithmetic
+  intensity (thousands of sequential fused-multiply-add-shaped
+  operations per element, only one read and one write total per
+  thread), so memory traffic is negligible and the measured time
+  reflects the GPU's real sustained arithmetic rate instead. Verified
+  directly: an escape-time fractal kernel (many loop iterations per
+  output element, minimal memory traffic per element) measured against
+  the memory-bound ceiling appeared to exceed it by roughly 19-37x
+  depending on problem size -- not because the GPU exceeded its own
+  specification, but because that ceiling was never measuring the right
+  thing for a kernel shaped like this one. Measured against the
+  compute-bound ceiling instead, the same kernel's real utilization
+  came out as a sane, sub-100% fraction.
+- **Roofline ridge point** (compute ceiling ÷ bandwidth ceiling) is the
+  arithmetic intensity, in FLOPs per byte of memory traffic, above
+  which a kernel is compute-bound and below which it is memory-
+  bandwidth-bound on this specific hardware. Use it to sanity-check
+  which ceiling actually applies to a given kernel before comparing its
+  measured throughput against either one.
 
 **These are hints, not promises.** A project-specific measurement from
 `compare`, run against your actual workload, always takes precedence
