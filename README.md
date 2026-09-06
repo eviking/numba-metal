@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="numba-metal logo" width="240">
+</p>
+
 # numba-metal
 
 An out-of-tree GPU backend that lets you write a constrained subset of
