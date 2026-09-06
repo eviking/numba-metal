@@ -232,3 +232,49 @@ def test_numpy_bool_global_constant_is_emitted_as_true_or_false() -> None:
     sig = (types.float32[::1], types.float32[::1])
     src = _lower(f, sig)
     assert "true" in src
+
+
+# `_find_merge`'s "fewest dominators" tie-break picked a far-downstream
+# block over the correct, nearby merge point for an if/else NESTED
+# inside another if's true-arm, whenever more code (here, a second,
+# sibling `if`) followed the outer if before the function's own next
+# real branch point. The nearby, correct merge is MORE deeply nested
+# (dominated by the outer arm's entry too, hence more dominators); the
+# wrong, far merge is LESS nested (also reachable directly from outside
+# the outer if, hence fewer dominators) despite being farther away in
+# control flow -- dominator-set size tracks nesting depth, not
+# control-flow distance. This duplicated the sibling `if` (and
+# everything after it) into both arms of the inner if, and recursively
+# so for the inner if's own two branches: verified directly to be
+# exponential in the number of such nested/sequential if pairs, and
+# observed inflating a ~50-line real kernel (a tiled stencil using
+# threadgroup shared memory, with several halo-boundary clamp checks)
+# to nearly 700 lines of generated MSL, with a real ~5-10% throughput
+# cost verified on real Metal hardware once fixed.
+def test_nested_if_followed_by_sibling_if_does_not_duplicate_code() -> None:
+    def f(cur, out, n, local_x, tile_x0):
+        i = metal.grid(1)
+        if i < out.size:
+            if local_x == 0:
+                gxm = tile_x0 - 1
+                if gxm < 0:
+                    gxm = 0
+                out[0] = cur[gxm]
+            if local_x == 3:
+                out[1] = 99.0
+            out[2] = 1.0
+
+    sig = (
+        types.float32[::1],
+        types.float32[::1],
+        types.int32,
+        types.int64,
+        types.int64,
+    )
+    src = _lower(f, sig)
+    # Each of these source-level statements must appear in the generated
+    # MSL exactly once -- any duplication means the merge-point bug (or
+    # a regression of its fix) has resurfaced.
+    assert src.count("arg_out[0] =") == 1
+    assert src.count("arg_out[1] =") == 1
+    assert src.count("arg_out[2] =") == 1

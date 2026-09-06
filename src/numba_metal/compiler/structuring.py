@@ -464,12 +464,51 @@ class Structurer:
         false_t) from candidacy fixes this case while preserving the
         legitimate one-sided-if shape, where false_t genuinely is the
         correct merge and must remain a valid candidate.
+
+        A second, separate bug in the same "fewest dominators" tie-break:
+        for a NESTED if/else -- one whose enclosing block is itself one
+        arm of an outer if, with more code (e.g. a sibling `if` at the
+        outer nesting level) following the outer if before the whole
+        function's true final merge -- the inner if's real, immediate
+        merge block is MORE deeply nested (dominated by the outer
+        branch's arm entry too) and so has MORE dominators than a
+        far-downstream block that also happens to be reachable from both
+        of the inner if's arms (because the inner arm's natural
+        fallthrough eventually reaches that same far block). Dominator-
+        set SIZE tracks nesting depth, not control-flow distance, so
+        "fewest dominators" can and did pick the far, wrong block over
+        the near, correct one. Concretely: `if a: (if b: x=0); if c: y=1;
+        z=2` structures the inner `if b` with a merge candidate set
+        containing both the correct immediate merge (dominated by the
+        outer if's true-arm entry, so more dominators) and the outer
+        if's own eventual merge past the `if c` sibling (fewer
+        dominators, because it's reachable directly from the function
+        entry too) -- `min()` picked the latter, duplicating the `if c`
+        sibling (and everything after) into both arms of the inner if,
+        and recursively so for the inner if's own two branches -- verified
+        directly to be exponential in the number of such nested/sequential
+        if pairs, and observed inflating a ~50-line real kernel to nearly
+        700 lines of generated MSL. Fixed by requiring a real merge
+        candidate to actually be dominated by `branch_label` itself (the
+        branch doing the diverging) -- a block that is NOT dominated by
+        the branch can't be "this if statement's own continuation," by
+        definition, regardless of its dominator-set size. Falls back to
+        the unrestricted candidate set only if that filter would empty it
+        (keeps every previously-passing case, including the one-sided-if
+        and repeated-boolean-test shapes above, working exactly as
+        before, since in both of those `branch_label` already dominates
+        every real candidate).
         """
         true_reach = self._reachable_without_loop_back(true_t)
         false_reach = self._reachable_without_loop_back(false_t)
         common = (true_reach & false_reach) - {true_t}
         if not common:
             return None
+        dominated_common = {
+            lbl for lbl in common if self.cfg.dominates(branch_label, lbl)
+        }
+        if dominated_common:
+            common = dominated_common
         # The merge point is the common label with the fewest dominators
         # (i.e. the earliest merge point).
         return min(common, key=lambda lbl: len(self.cfg.dominators[lbl]))
