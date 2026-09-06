@@ -41,6 +41,16 @@ applied to both sides together, matching monte_carlo_paths.py's own
 conversion and its finding: a sequential, stride-1 per-thread sweep
 gains nothing measurable from native 2D indexing over manual flat-index
 arithmetic, since both compile to the same row-major offset math.
+
+Also compares a CPU-side reduction (kernel writes the average price;
+`payoff.mean()` runs on the host after `copy_to_host()`) against a
+GPU-side one (`_make_metal_payoff_kernel` writes the payoff directly;
+`metal.reduce_sum()` sums it on the GPU, so only a 1-element buffer
+round-trips to the host) -- the same comparison monte_carlo_paths.py
+makes, at this file's larger problem sizes (up to 2,000,000 paths,
+n_steps=500) to see whether the GPU-reduced win (found there to grow
+with array size, from a loss at 10,000 paths to ~16% faster at
+10,000,000) persists here too.
 """
 
 from __future__ import annotations
@@ -130,6 +140,40 @@ def _make_metal_kernel():
             out[p] = running_sum / n_steps
 
     return metal_kernel
+
+
+def _make_metal_payoff_kernel():
+    """Like `_make_metal_kernel`, but writes each path's discounted-later
+    call-option payoff (`max(avg_price - K, 0)`) directly, instead of the
+    raw average price -- mirrors monte_carlo_paths.py's
+    `_make_metal_payoff_kernel`, so the "average price -> payoff" step
+    that would otherwise run on the CPU after `copy_to_host()` happens on
+    the GPU, leaving only a single scalar `metal.reduce_sum()` (see
+    numba_metal/reductions.py) plus a tiny host-side mean/discount
+    computation. Applying this here too (not just in
+    monte_carlo_paths.py) matters more at this file's scale: n_steps=500
+    (5x monte_carlo_paths.py's 100) means each path's payoff array is the
+    same size but the compute-to-transfer ratio is already high, so this
+    tests whether the GPU-reduced win persists at the largest problem
+    sizes this benchmark suite exercises (up to 2,000,000 paths)."""
+    from numba_metal import metal
+
+    @metal.jit
+    def metal_payoff_kernel(z, out, n_steps, s0, k, drift, diffusion):
+        p = metal.grid(1)
+        if p < out.size:
+            log_s = math.log(s0)
+            running_sum = 0.0
+            for step in range(n_steps):
+                log_s = log_s + drift + diffusion * z[p, step]
+                running_sum = running_sum + math.exp(log_s)
+            avg_price = running_sum / n_steps
+            payoff = avg_price - k
+            if payoff < 0.0:
+                payoff = 0.0
+            out[p] = payoff
+
+    return metal_payoff_kernel
 
 
 def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResult]:
@@ -257,13 +301,59 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             gpu_estimate = float(
                 np.exp(-R * T) * np.maximum(gpu_avg_price - K, 0.0).mean()
             )
-            result.correctness_ok = cpu_ok and gpu_ok
+
+            # GPU-reduced variant: the payoff kernel writes
+            # max(avg_price-K,0) directly, and metal.reduce_sum() sums it
+            # on the GPU -- only a 1-element buffer round-trips to the
+            # host, instead of the full n_paths-element array. Compares
+            # directly against `launch_and_reduce` above (identical work,
+            # different reduction strategy) for an honest, apples-to
+            # -apples before/after of this specific primitive, matching
+            # monte_carlo_paths.py's own comparison.
+            payoff_kernel = _make_metal_payoff_kernel()
+            d_payoff = metal.device_array(n_paths, np.float32)
+
+            def payoff_launch():
+                payoff_kernel[blocks, threads](
+                    d_z,
+                    d_payoff,
+                    np.int32(n_steps),
+                    np.float32(S0),
+                    np.float32(K),
+                    drift,
+                    diffusion,
+                )
+
+            def launch_and_reduce_on_gpu():
+                payoff_launch()
+                total = metal.reduce_sum(d_payoff)
+                return float(np.exp(-R * T) * total.copy_to_host()[0] / n_paths)
+
+            launch_and_reduce_on_gpu()  # warm up / compile
+            t_e2e_gpu_reduced = time_repeated(
+                launch_and_reduce_on_gpu, warmup=2, repeats=5
+            )
+            result.extra["metal_gpu_reduced_end_to_end_ns"] = (
+                t_e2e_gpu_reduced.median_ns
+            )
+
+            gpu_reduced_estimate = launch_and_reduce_on_gpu()
+            gpu_reduced_ok, gpu_reduced_note = assert_allclose(
+                np.array([gpu_reduced_estimate]),
+                np.array([numpy_estimate]),
+                rtol=0.05,
+                atol=0.5,
+            )
+
+            result.correctness_ok = cpu_ok and gpu_ok and gpu_reduced_ok
             result.correctness_note = (
                 f"cpu_par={cpu_estimate:.4f} gpu={gpu_estimate:.4f} "
+                f"gpu_reduced={gpu_reduced_estimate:.4f} "
                 f"numpy={numpy_estimate:.4f} (cpu-vs-cpu: {cpu_note}; "
-                f"gpu-vs-cpu: {gpu_note})"
+                f"gpu-vs-cpu: {gpu_note}; gpu_reduced: {gpu_reduced_note})"
             )
             result.extra["gpu_estimate"] = gpu_estimate
+            result.extra["gpu_reduced_estimate"] = gpu_reduced_estimate
         else:
             result.correctness_ok = cpu_ok
             result.correctness_note = (
@@ -281,6 +371,17 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
 
 
 if __name__ == "__main__":
-    from common import print_table
+    from common import format_ns, print_table
 
-    print_table(run())
+    results = run()
+    print_table(results)
+    print()
+    for r in results:
+        e2e_cpu_reduced = r.metal_end_to_end_warm_ns
+        e2e_gpu_reduced = r.extra.get("metal_gpu_reduced_end_to_end_ns")
+        if e2e_gpu_reduced is not None and e2e_cpu_reduced:
+            print(
+                f"{r.benchmark} {r.size_label}: end-to-end with CPU-side "
+                f"reduction={format_ns(e2e_cpu_reduced)} vs. GPU-side "
+                f"reduction (metal.reduce_sum)={format_ns(e2e_gpu_reduced)}"
+            )
