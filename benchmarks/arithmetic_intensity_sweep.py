@@ -37,8 +37,6 @@ import math
 import sys
 
 import numpy as np
-from numba import njit, prange
-
 from common import (
     Timing,
     get_environment_info,
@@ -47,6 +45,7 @@ from common import (
     require_metal_or_skip,
     time_repeated,
 )
+from numba import njit, prange
 
 GRID_N = 1024
 ITERATIONS = 200
@@ -68,7 +67,9 @@ def arithmetic_intensity(reps: int) -> float:
     # (summing the 4 products) + 1 multiply (DT * ...) + 1 add
     # (center + ...) = 13 FLOPs/point at reps=0, before any exp() reps.
     base_flops_per_point = 13
-    flops_per_point = base_flops_per_point + NEIGHBORS * reps * FLOPS_PER_NEIGHBOR_PER_REP
+    flops_per_point = (
+        base_flops_per_point + NEIGHBORS * reps * FLOPS_PER_NEIGHBOR_PER_REP
+    )
     return flops_per_point / BYTES_PER_POINT
 
 
@@ -221,8 +222,12 @@ def main():
         default=[1, 2, 4, 8, 16, 32, 64, 128],
         help="Coefficient-evaluation repeat counts to sweep (controls FLOPs/byte).",
     )
-    parser.add_argument("--output", type=str, default=None, help="Write JSON results here.")
-    parser.add_argument("--grid", type=int, default=GRID_N, help="Grid size N (grid is NxN).")
+    parser.add_argument(
+        "--output", type=str, default=None, help="Write JSON results here."
+    )
+    parser.add_argument(
+        "--grid", type=int, default=GRID_N, help="Grid size N (grid is NxN)."
+    )
     args = parser.parse_args()
 
     metal_available = require_metal_or_skip()
@@ -233,9 +238,15 @@ def main():
     grid_n = args.grid
     grid = _initial_grid(grid_n)
 
-    print(f"Arithmetic-intensity sweep: {grid_n}x{grid_n} grid, {ITERATIONS} iterations, "
-          f"fixed 4-neighbor/20-byte-per-point access pattern.")
-    print(f"{'REPS':>6} {'FLOPs/byte':>12} {'CPU (parallel)':>18} {'Metal (resident)':>20} {'Speedup':>10}")
+    print(
+        f"Arithmetic-intensity sweep: {grid_n}x{grid_n} grid, "
+        f"{ITERATIONS} iterations, "
+        f"fixed 4-neighbor/20-byte-per-point access pattern."
+    )
+    print(
+        f"{'REPS':>6} {'FLOPs/byte':>12} {'CPU (parallel)':>18} "
+        f"{'Metal (resident)':>20} {'Speedup':>10}"
+    )
 
     rows = []
     for reps in args.reps:
@@ -259,10 +270,12 @@ def main():
     # Locate the empirical crossover: first REPS value where speedup >= 1.0x,
     # linearly interpolated in log-AI space between the bracketing points.
     crossover_ai = None
-    for prev, cur in zip(rows, rows[1:]):
+    for prev, cur in zip(rows, rows[1:], strict=False):
         if prev["speedup_vs_cpu"] < 1.0 <= cur["speedup_vs_cpu"]:
-            lo_ai, lo_s = prev["arithmetic_intensity_flops_per_byte"], prev["speedup_vs_cpu"]
-            hi_ai, hi_s = cur["arithmetic_intensity_flops_per_byte"], cur["speedup_vs_cpu"]
+            lo_ai = prev["arithmetic_intensity_flops_per_byte"]
+            lo_s = prev["speedup_vs_cpu"]
+            hi_ai = cur["arithmetic_intensity_flops_per_byte"]
+            hi_s = cur["speedup_vs_cpu"]
             frac = (1.0 - lo_s) / (hi_s - lo_s)
             if lo_ai <= 0:
                 crossover_ai = lo_ai + frac * (hi_ai - lo_ai)
@@ -283,9 +296,15 @@ def main():
     }
 
     if crossover_ai is not None:
-        print(f"\nEmpirical parity crossover (interpolated): ~{crossover_ai:.2f} FLOPs/byte")
+        print(
+            f"\nEmpirical parity crossover (interpolated): "
+            f"~{crossover_ai:.2f} FLOPs/byte"
+        )
     else:
-        print("\nNo crossover observed in this REPS range (all points on one side of parity).")
+        print(
+            "\nNo crossover observed in this REPS range "
+            "(all points on one side of parity)."
+        )
 
     if args.output:
         with open(args.output, "w") as f:
