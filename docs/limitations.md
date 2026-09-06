@@ -7,22 +7,39 @@ gap, not evidence it works.
 
 ## Unsupported Python features
 
-- **`while` loops are supported only in straight-line form**: the loop
-  body may not contain a nested `if`/`else`, `break`, or `continue`.
-  Numba's bytecode lowering rotates `while cond: body` into a
-  do-while-shaped CFG distinct from `for x in range(...)`'s shape;
-  generalizing this backend's control-flow structurer to handle
-  break/continue nested inside a conditional within a rotated `while`
-  body was found, by direct testing, to require a substantially larger
-  structurer rewrite than in scope for the pass that added `while`
-  support -- so that specific combination is explicitly rejected with
-  `UnsupportedFeatureError` at compile time (not silently mis-lowered;
+- **`while` loops may contain a nested `if`/`else`, but not `break` or
+  `continue` inside one.** Numba's bytecode lowering rotates
+  `while cond: body` into a do-while-shaped CFG distinct from
+  `for x in range(...)`'s shape, and when the body opens with an
+  `if`/`else` (or otherwise doesn't put the condition re-test in the
+  same block as the loop-carried phi nodes), the loop's real header and
+  its real condition-test block end up as two different blocks --
+  detected and handled as a `RotatedWhileNode` (see
+  `compiler/structuring.py`'s extensive module comments for the full
+  CFG-shape explanation), reusing the same if/else/break/continue
+  structuring a `for`-range loop's body already used correctly. This
+  covers ordinary if/else logic inside a `while` body (e.g. accumulate
+  differently depending on a per-iteration condition, common in
+  iterative numerical methods like Newton-Raphson) -- see
+  `tests/integration/test_while_loops.py`'s
+  `test_while_loop_with_nested_if_else_*` tests, verified correct
+  across 1000 real parallel GPU threads with varied data, not just a
+  single-thread smoke test.
+
+  `break`/`continue` NESTED INSIDE that if/else remain unsupported and
+  explicitly rejected with `UnsupportedFeatureError` at compile time
+  (not silently mis-lowered): generalizing the structurer to handle
+  that specific combination was found, by direct testing, to require a
+  substantially larger rewrite than was in scope when this was fixed --
   two intermediate, silently-wrong-result bugs were found and fixed
-  during development -- see `tests/integration/test_while_loops.py` and
-  `docs/architecture.md`). A straight-line `while` (recompute some
-  values, test a condition, repeat -- e.g. a compare-and-swap retry
-  loop, or a simple accumulation) is fully supported and tested. Any
-  other unrecognized loop shape still raises `UnsupportedFeatureError`.
+  during earlier `while`-loop development, and that specific
+  break/continue-inside-if combination remains the one shape not
+  proven safe (see `tests/integration/test_while_loops.py`'s
+  `test_while_loop_rejects_nested_break`/`_continue` and
+  `docs/architecture.md`). A straight-line `while` body, or one with an
+  if/else but no break/continue inside it, is fully supported and
+  tested. Any other unrecognized loop shape still raises
+  `UnsupportedFeatureError`.
 - **Calling other Python functions from within a kernel is supported
   only via `@metal.device_func`** (a decorator, not calling an
   arbitrary undecorated function). Scalar arguments and return type
@@ -107,6 +124,21 @@ gap, not evidence it works.
 - No `int8`/`int16`/`uint8`/`uint16`.
 - `uint64` has a type mapping but is not exercised by any kernel in this
   repository's test suite or benchmarks -- treat it as unverified.
+- **`int64` device-array kernel ARGUMENTS have been found to trigger a
+  real Metal shader-compiler failure for at least one real kernel
+  shape** (nested `for` loops with no other unusual features), even
+  though the generated MSL text itself looks well-formed and `int64` is
+  otherwise documented as supported. Reproduced directly: the identical
+  kernel body compiles and runs correctly with an `int32` output array,
+  and fails with `AGXMetalG16X ... XPC_ERROR_CONNECTION_INTERRUPTED`
+  (a real Metal-driver-level shader-compiler error, not a numba-metal
+  exception) with an `int64` one. Not yet root-caused or minimally
+  reproduced further -- found incidentally while adding
+  `tests/integration/test_while_loops.py` coverage, unrelated to that
+  file's own subject (the working test there uses `int32`). Treat
+  `int64` OUTPUT arrays specifically as unverified until this is
+  investigated; `int64` used only for scalars/loop counters (as
+  `metal.grid()` already does internally) has not shown this problem.
 
 ## Hardware requirements
 

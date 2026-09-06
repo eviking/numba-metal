@@ -31,7 +31,7 @@ scale used, and the gaps found and closed while producing that audit.
 | `for x in range(...)` | Supported | 1, 2, or 3-argument `range`; compiles to a native MSL `for` loop |
 | `break` / `continue` in loops | Supported | |
 | `return` (no value) | Supported | Kernels must not return a value |
-| `while` loops | Partially supported | Straight-line body only (no nested `if`/`else`, `break`, or `continue`) -- e.g. a compare-and-swap retry loop or simple accumulation; a `while` with a nested conditional raises `UnsupportedFeatureError` rather than risking the confirmed-possible silent-wrong-result failure mode found during development. See `docs/limitations.md` and `tests/integration/test_while_loops.py`. |
+| `while` loops | Partially supported | Straight-line body, or a body with a nested `if`/`else` containing no `break`/`continue`, are both supported -- e.g. a compare-and-swap retry loop, a simple accumulation, or an iterative numerical method (Newton-Raphson, etc.) that branches differently per iteration. `break`/`continue` NESTED INSIDE that if/else remain unsupported and raise `UnsupportedFeatureError` rather than risking the confirmed-possible silent-wrong-result failure mode found during development. See `docs/limitations.md` and `tests/integration/test_while_loops.py`. |
 | Recursion | Unsupported | Direct recursion in a `@metal.device_func` is rejected by Numba's own frontend at typing time; mutual/transitive recursion between two device functions is rejected by numba-metal's own in-progress-compilation cycle detection (see `_compile_device_function`) -- both fail with a clear compile-time error, not a stack overflow or hang |
 | Exceptions (`try`/`except`/`raise`) | Unsupported | |
 | Classes | Unsupported | |

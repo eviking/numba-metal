@@ -1,17 +1,23 @@
 """Standalone tests for numba-metal's `while` loop support: a real
 compiler-correctness capability (not merely a documented gap), added and
-fixed while adding compare-and-swap-based atomics.
+fixed while adding compare-and-swap-based atomics, and later extended
+to support a nested `if`/`else` inside the loop body.
 
-Only straight-line `while` bodies are supported (no nested `if`/`else`,
-`break`, or `continue` inside the loop) -- see docs/limitations.md for
-exactly why: Numba's bytecode lowering rotates `while cond: body` into a
-CFG shape distinct from `for x in range(...)`, and generalizing this
-backend's control-flow structurer to handle break/continue nested inside
-a conditional within a rotated while body was found, by direct testing,
-to require a substantially larger rewrite than this project's scope for
-this pass -- so that combination is explicitly rejected at compile time
-rather than risking the confirmed-possible silent-wrong-result failure
-mode.
+A `while` body may be straight-line, OR contain a nested `if`/`else`
+with no `break`/`continue` inside it -- see docs/limitations.md for the
+full CFG-shape explanation: Numba's bytecode lowering rotates
+`while cond: body` into a shape distinct from `for x in range(...)`,
+and when the body opens with an if/else, the loop's real header (the
+back-edge target, holding the loop-carried phi nodes) and its real
+condition-test block end up as two DIFFERENT blocks -- detected and
+handled as a `RotatedWhileNode` (see `compiler/structuring.py`).
+`break`/`continue` NESTED INSIDE that if/else remain unsupported and
+explicitly rejected at compile time: generalizing the structurer to
+handle that specific combination was found, by direct testing, to
+require a substantially larger rewrite than was in scope when this was
+fixed, and two intermediate, silently-wrong-result bugs were found and
+fixed along the way -- so that combination stays rejected rather than
+risking a third.
 
 Requires a working Apple-silicon Metal device; see tests/conftest.py.
 """
@@ -214,13 +220,24 @@ def test_while_loop_rejects_nested_break() -> None:
         kernel[1, 1](d_a, d_out)
 
 
-def test_while_loop_rejects_nested_if_without_break_or_continue() -> None:
-    """Even a nested if/else with no break/continue at all is rejected:
-    this backend's rotated-while lowering was only verified correct for
-    a straight-line body, and a conditional inside the loop changes the
-    CFG shape regardless of whether it contains a break/continue."""
-    from numba_metal.errors import UnsupportedFeatureError
-
+def test_while_loop_with_nested_if_else_and_no_break_or_continue() -> None:
+    """A nested if/else with no `break`/`continue` anywhere -- unlike
+    the two rejected shapes above -- is genuinely supported: Numba's
+    rotated-`while` lowering puts the loop's condition test in a
+    DIFFERENT block from the loop-carried phi nodes when the body opens
+    with an if/else (a native `for x in range(...)` loop never has this
+    split, since it always gets a dedicated header block regardless of
+    body content), which the structurer now detects and handles as a
+    `RotatedWhileNode` -- see structuring.py's docstring for the full
+    CFG-shape explanation and compiler/structuring.py's own extensive
+    module comments. `break`/`continue` NESTED INSIDE the if/else remain
+    unsupported (see the two tests above) -- that combination was
+    confirmed, by direct testing, to produce genuinely swapped/wrong
+    control flow in this backend's earlier lowering, and fixing it is
+    out of scope for this fix, which only covers the narrower,
+    dominance-provably-safe case exercised here (every arm of the
+    if/else falls through to the loop's own next-iteration test, never
+    jumping anywhere else)."""
     metal = _metal()
 
     @metal.jit
@@ -235,7 +252,137 @@ def test_while_loop_rejects_nested_if_without_break_or_continue() -> None:
             i = i + 1
         out[0] = total
 
-    d_a = metal.to_device(np.array([1.0, -2.0], dtype=np.float32))
+    a = np.array([1.0, -2.0, 3.0, -4.0, 5.0], dtype=np.float32)
+    d_a = metal.to_device(a)
     d_out = metal.device_array(1, np.float32)
-    with pytest.raises(UnsupportedFeatureError):
-        kernel[1, 1](d_a, d_out)
+    kernel[1, 1](d_a, d_out)
+    metal.synchronize()
+    expected = float(np.sum(np.abs(a)))
+    assert d_out.copy_to_host()[0] == pytest.approx(expected)
+
+
+def test_while_loop_with_nested_if_else_matches_numpy_across_many_threads() -> None:
+    """Same shape as above, but launched across many real GPU threads
+    at once with varied per-thread data, to verify correctness under
+    real parallelism -- not just a single-thread smoke test."""
+    metal = _metal()
+
+    @metal.jit
+    def kernel(a, out, n):
+        idx = metal.grid(1)
+        if idx < out.size:
+            i = 0
+            total = 0.0
+            while i < n:
+                if a[idx * n + i] > 0.0:
+                    total = total + a[idx * n + i]
+                else:
+                    total = total - a[idx * n + i]
+                i = i + 1
+            out[idx] = total
+
+    n_threads = 1000
+    n_per_thread = 37
+    rng = np.random.default_rng(123)
+    a = rng.uniform(-5, 5, n_threads * n_per_thread).astype(np.float32)
+    expected = np.abs(a.reshape(n_threads, n_per_thread)).sum(axis=1)
+
+    d_a = metal.to_device(a)
+    d_out = metal.device_array(n_threads, np.float32)
+    threads = 256
+    blocks = (n_threads + threads - 1) // threads
+    kernel[blocks, threads](d_a, d_out, np.int32(n_per_thread))
+    metal.synchronize()
+    np.testing.assert_allclose(d_out.copy_to_host(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_while_loop_with_one_sided_if_no_else() -> None:
+    """A ONE-SIDED `if` (no `else`) inside a `while` body -- a real,
+    separate regression found while testing the two-sided if/else fix
+    above: `_is_loop_header`'s dominance check alone produced a false
+    positive here, misidentifying the if's own merge block (which
+    happens to also contain the loop's real condition test, and so
+    trivially dominates the eventual back-edge) as a `for`-range-style
+    loop body split. Fixed by additionally requiring that the
+    candidate exit branch cannot reach the candidate body branch by
+    ordinary forward flow (see `_is_genuine_loop_split`/`_can_reach` in
+    compiler/structuring.py) before trusting the dominance check."""
+    metal = _metal()
+
+    @metal.jit
+    def kernel(a, out):
+        i = 0
+        total = 0.0
+        while i < a.size:
+            if a[i] > 0.0:
+                total = total + a[i]
+            i = i + 1
+        out[0] = total
+
+    a = np.array([1.0, -2.0, 3.0, -4.0, 5.0, -6.0], dtype=np.float32)
+    d_a = metal.to_device(a)
+    d_out = metal.device_array(1, np.float32)
+    kernel[1, 1](d_a, d_out)
+    metal.synchronize()
+    expected = float(np.sum(a[a > 0.0]))
+    assert d_out.copy_to_host()[0] == pytest.approx(expected)
+
+
+def test_while_loop_with_if_else_never_entering_body() -> None:
+    """The loop condition is false from the very first check -- the
+    if/else inside it must never execute at all, and the loop-carried
+    variables' pre-loop values must pass through unchanged."""
+    metal = _metal()
+
+    @metal.jit
+    def kernel(a, out):
+        i = 100
+        total = 0.0
+        while i < 10:
+            if a[i - 100] > 0.0:
+                total = total + 1.0
+            else:
+                total = total - 1.0
+            i = i + 1
+        out[0] = total
+
+    d_a = metal.to_device(np.array([1.0], dtype=np.float32))
+    d_out = metal.device_array(1, np.float32)
+    kernel[1, 1](d_a, d_out)
+    metal.synchronize()
+    assert d_out.copy_to_host()[0] == pytest.approx(0.0)
+
+
+def test_nested_for_loops_still_correct_after_while_if_else_fix() -> None:
+    """Regression coverage for a real intermediate bug found while
+    fixing the while+if/else shapes above: an early, over-broad version
+    of the loop-header-vs-merge-block distinguishing check (see
+    `_can_reach` in compiler/structuring.py) treated an OUTER loop's
+    exit target as able to reach an INNER loop's body target simply
+    because it technically can, by looping all the way back around the
+    outer loop's own back-edge first -- wrongly rejecting genuinely
+    nested `for`-range loops that have no `if`/`while` of their own at
+    all. Fixed by excluding back-edge crossings from that reachability
+    search. This test has no `if`/`else` or `while` in it whatsoever --
+    it exists purely to prove the while-loop fix didn't regress
+    ordinary nested for-loops."""
+    metal = _metal()
+
+    @metal.jit
+    def kernel(out, n, m):
+        i = metal.grid(1)
+        if i < out.size:
+            total = 0
+            for j in range(n):
+                inner = 0
+                for k in range(m):
+                    inner = inner + k
+                total = total + inner + j
+            out[i] = total
+
+    n, m = 5, 6
+    d_out = metal.device_array(4, np.int32)
+    kernel[1, 4](d_out, np.int32(n), np.int32(m))
+    metal.synchronize()
+    expected = sum(sum(range(m)) + j for j in range(n))
+    np.testing.assert_array_equal(d_out.copy_to_host(), np.full(4, expected))

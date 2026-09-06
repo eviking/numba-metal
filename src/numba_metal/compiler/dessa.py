@@ -101,6 +101,7 @@ from numba_metal.compiler.structuring import (
     LoopNode,
     Node,
     ReturnNode,
+    RotatedWhileNode,
     Seq,
 )
 from numba_metal.errors import UnsupportedFeatureError
@@ -327,6 +328,17 @@ def _collect_all_block_labels(node: Node, out: set[int]) -> None:
             _collect_all_block_labels(node.else_branch, out)
     elif isinstance(node, LoopNode):
         out.add(node.header_label)
+        _collect_all_block_labels(node.body, out)
+    elif isinstance(node, RotatedWhileNode):
+        # Unlike LoopNode, the header block here is NOT re-emitted
+        # separately from `node.body` (no pre_test/do-while special
+        # -casing -- see RotatedWhileNode's and `_emit_rotated_while`'s
+        # docstrings): it is already an ordinary BasicBlockNode inside
+        # `node.body`, structured by the same _structure_branch/
+        # structure_from machinery an if/else or for-loop body uses.
+        # Recursing into `node.body` alone (matching how IfNode recurses
+        # into its branches, not how LoopNode separately adds its own
+        # header_label) finds it there.
         _collect_all_block_labels(node.body, out)
     elif isinstance(node, ReturnNode | BreakNode | ContinueNode):
         pass

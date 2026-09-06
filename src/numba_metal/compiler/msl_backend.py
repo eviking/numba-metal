@@ -59,6 +59,7 @@ from numba_metal.compiler.structuring import (
     LoopNode,
     Node,
     ReturnNode,
+    RotatedWhileNode,
     Seq,
     structure_function,
 )
@@ -1047,6 +1048,14 @@ class MSLKernelLowerer:
                     node, for_info.loop_var_name, for_info.range_target
                 )
             self._compute_suppressed_names(node.body)
+        elif isinstance(node, RotatedWhileNode):
+            # Never for-range-shaped (that pattern always structures to
+            # a plain LoopNode instead -- see `_structure_loop` vs.
+            # `_structure_rotated_while` in structuring.py), so there is
+            # no loop-protocol-name suppression to compute for this node
+            # itself, but any nested for-range loop INSIDE its body
+            # still needs its own suppressed-names pass.
+            self._compute_suppressed_names(node.body)
 
     def _suppress_loop_protocol_names(
         self, node: LoopNode, loop_var_name: str, range_target: str
@@ -1134,6 +1143,8 @@ class MSLKernelLowerer:
             self._emit_if(node)
         elif isinstance(node, LoopNode):
             self._emit_loop(node)
+        elif isinstance(node, RotatedWhileNode):
+            self._emit_rotated_while(node)
         elif isinstance(node, ReturnNode):
             if self.device_function and node.value is not None:
                 ty = self.typemap.get(node.value.name)
@@ -1300,6 +1311,26 @@ class MSLKernelLowerer:
                 cond_expr if node.exit_cond_negated else f"!({cond_expr})"
             )
             self.builder.write(f"}} while ({cond_for_continue});")
+        self.builder.write("}")
+
+    def _emit_rotated_while(self, node: RotatedWhileNode) -> None:
+        """Emit a `while` loop whose header and condition-test blocks
+        are different (see `RotatedWhileNode`'s docstring -- this arises
+        when the loop body starts with an `if`/`else` rather than
+        straight-line statements). Unlike `_emit_loop`'s generic
+        do-while path, `node.body` here is built entirely from ordinary
+        `BasicBlockNode`/`IfNode`/`BreakNode`/`ContinueNode` structure
+        (via the same `_structure_branch`/`structure_from` machinery a
+        `for`-range loop's body already uses) -- it already contains the
+        real condition test as an ordinary `if (...) break;`/`continue;`
+        pair, so this is a plain `while (true) { ... }` wrapper with no
+        special-cased pre_test/do-while emission, and no separate
+        edge-copy handling: every `BasicBlockNode` inside `node.body`
+        already runs its own `_emit_edge_copies` via the ordinary
+        `_emit_basic_block` path (see that method)."""
+        self.builder.write("while (true) {")
+        with self.builder.block():
+            self._emit_node(node.body)
         self.builder.write("}")
 
     def _trivial_back_edge_label(self, node: Node) -> int | None:
