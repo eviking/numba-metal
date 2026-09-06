@@ -89,12 +89,15 @@ against NumPy and Numba, and honest wins/losses (open the file directly in a
 browser, or view it rendered on GitHub via
 [htmlpreview](https://htmlpreview.github.io/?https://github.com/eviking/numba-metal/blob/main/docs/benchmark-report.html)).
 
-Eight benchmark programs (`benchmarks/*.py`) compare plain Python, NumPy,
+Nine benchmark programs (`benchmarks/*.py`) compare plain Python, NumPy,
 Numba CPU (`@njit`), and numba-metal, at multiple problem sizes, with
 correctness checks and cold/warm/transfer-inclusive timing. Five are wired
-into one runner; the rest (cyclist aerodynamics, implied volatility, Asian
+into one runner; three more (cyclist aerodynamics, implied volatility, Asian
 option pricing) measure their own CPU-vs-Metal comparison directly since
-they don't share `run_all.py`'s shape:
+they don't share `run_all.py`'s shape; the ninth
+(`device_function_compile_cache.py`) is compiler infrastructure rather than
+a numerical workload — it measures cold-compile time, not runtime, for
+kernels sharing a `@metal.device_func`:
 
 ```bash
 python benchmarks/run_all.py            # text report (5 core benchmarks)
@@ -103,6 +106,7 @@ python benchmarks/run_all.py --quick    # smaller sizes, for a fast check
 python benchmarks/cyclist_aerodynamics.py
 python benchmarks/implied_volatility.py
 python benchmarks/asian_option_pricing.py
+python benchmarks/device_function_compile_cache.py
 ```
 
 See `docs/benchmarking.md` for methodology and how to interpret results.

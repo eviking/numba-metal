@@ -550,9 +550,11 @@ state for subsequent launches. See
   results that match ordinary float32 arithmetic more closely.
 - **Integer `//`.** MSL's native integer division truncates toward zero;
   Python's `//` floors toward negative infinity. These agree for
-  non-negative operands (the only case exercised by the five benchmark
-  kernels, which use `//` for non-negative flattened-index arithmetic)
-  and are documented to differ for negative operands.
+  non-negative operands and are documented to differ for negative
+  operands -- see `docs/limitations.md`. This backend performs no
+  runtime sign check or floor-division correction; a kernel that uses
+  `//` with operands that can go negative will silently get MSL's
+  truncating result, not Python's floor-division result.
 
 ## Runtime compilation and kernel cache
 

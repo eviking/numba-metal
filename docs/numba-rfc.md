@@ -180,8 +180,8 @@ kernel subset this project covers.
 
 | Python | Status |
 |---|---|
-| 3.12 | Full test suite run and passing (127 tests) |
-| 3.13 | Full test suite run and passing (127 tests); this repository's primary development environment |
+| 3.12 | Full test suite run and passing as of an earlier snapshot (127 tests); not re-verified against the current, larger suite on this interpreter version -- see CI (`.github/workflows/ci.yml`) for the current 3.12 matrix result |
+| 3.13 | Full test suite run and passing (334 tests as of this writing); this repository's primary development environment |
 | 3.10, 3.11 | Not tested on this machine (unavailable in the development environment); `requires-python` was deliberately narrowed to `>=3.12,<3.14` rather than claiming untested support |
 
 `pyproject.toml` pins `numba>=0.67,<0.68` to match exactly what has been

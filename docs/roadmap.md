@@ -183,18 +183,32 @@ against Metal's actual `metal_math` header.
 Risk: low.
 Complexity: small, incrementally.
 
-**Better multidimensional arrays** (native 2D/3D kernel ARGUMENTS with
-real `.shape`, instead of requiring manual flattening -- distinct from
-3D launch *grids*, which are done: `metal.grid(3)`/`kernel[(bx,by,bz),
-(tx,ty,tz)]` are implemented and tested)
-User value: removes the current requirement to flatten and hand-compute
-strides (as `heat_diffusion.py`/`pairwise_distance.py` do today).
-Dependency: extending the MSL backend's array-parameter handling to carry
-shape/stride metadata into generated indexing code.
-Risk: medium -- interacts with the 1D-array-only restriction that
-currently simplifies buffer binding; needs care to keep argument binding
-correct for non-contiguous or multi-dimensional layouts.
-Complexity: large.
+**Better multidimensional arrays** -- done for indexing; `.shape` remains
+open. Native 2D/3D kernel ARGUMENTS with real `arr[x, y]`/`arr[x, y, z]`
+indexing are implemented and tested (see `docs/supported-features.md`'s
+"Array dimensions" section, `tests/integration/test_multidim_arrays.py`),
+including as `@metal.device_func` array arguments with dimension
+parameters forwarded transitively through nested device-function calls.
+`heat_diffusion.py`, `mandelbrot.py`, `pairwise_distance.py`,
+`monte_carlo_paths.py`, and `asian_option_pricing.py` were all converted
+from manual flattened-index arithmetic to native indexing this way,
+fairly on both the Metal and Numba-CPU sides -- see
+`docs/performance-guidance.md` for the measured effect. What remains
+open: no `.shape` attribute inside a kernel body (only `.size`, the
+total flattened element count) -- a kernel that needs a specific
+dimension's size must still take it as a separately-passed scalar
+argument.
+User value (remaining): removes the need to pass per-dimension sizes as
+separate scalar arguments when a kernel could instead read them from the
+array's own shape.
+Dependency: extending the MSL backend's array-parameter handling to
+carry per-dimension size metadata accessible via a `.shape`-like
+expression, reusing the same `_dimN` companion-parameter mechanism
+already used for indexing.
+Risk: low -- the underlying metadata (`_dimN` parameters) already exists
+and is already correctly bound; this is an accessor, not new binding
+machinery.
+Complexity: small.
 
 **Broadcasting**
 User value: matches common NumPy usage patterns.

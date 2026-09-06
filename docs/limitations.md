@@ -115,6 +115,17 @@ gap, not evidence it works.
   machinery of its own for any array access -- and remains silent,
   undefined out-of-bounds behavior, same as any other
   out-of-range index in this project.
+- **Whole-array reductions (`metal.reduce_sum`/`reduce_min`/
+  `reduce_max`) support float32/int32/uint32 1D device arrays only.**
+  No 2D/3D array reduction, no other dtype, and no `argmax` (returning
+  the winning index alongside the value) -- only the value-only
+  reductions are implemented. This is a host-side helper built from
+  existing primitives (`metal.shared_array`, `metal.barrier`, atomics),
+  not a new compiler intrinsic, so its dtype ceiling is exactly MSL's
+  native/CAS-loop atomic dtype set (`_ATOMIC_DTYPES` in
+  `compiler/intrinsics.py`) -- there would be no way to combine
+  per-threadgroup partials for any other dtype. See
+  `numba_metal/reductions.py` and `tests/integration/test_reductions.py`.
 
 ## Type restrictions
 
