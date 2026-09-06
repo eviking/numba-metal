@@ -473,12 +473,22 @@ CPU/GPU crossover size. Real numbers from an Apple M4 Pro:
 
 | Metric | Value |
 |---|---|
-| Dispatch overhead | ~144 us |
-| Cold compile | ~99 ms |
-| Buffer allocation | ~62 us |
+| Dispatch overhead | ~170 us |
+| Cold compile | ~66 ms |
+| Buffer allocation | ~49 us |
 | Sync overhead | ~333 ns |
-| Float32 throughput | ~10 GFLOPS |
-| Memory bandwidth | ~60 GB/s |
+| Float32 throughput | ~37 GFLOPS |
+| Memory bandwidth | ~221 GB/s |
+
+The throughput and bandwidth figures are measured on a 100,000,000-
+element elementwise kernel specifically -- large enough that per-launch
+dispatch overhead (the row above it) is a small fraction of the
+measured time, so the number reflects genuine sustained throughput
+rather than mostly re-measuring dispatch overhead. (An earlier version
+of this calibration reused the same, much smaller problem size as the
+dispatch-overhead measurement for this step too, which understated real
+bandwidth by roughly 4-5x -- ~60 GB/s reported versus ~221 GB/s actually
+achievable at this problem size on the same hardware.)
 
 **These are hints, not promises.** A project-specific measurement from
 `compare`, run against your actual workload, always takes precedence
