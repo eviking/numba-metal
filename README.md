@@ -33,6 +33,16 @@ Numba's typed intermediate representation into Metal Shading Language
 (MSL), compiled by Apple's Metal shader compiler, and executed by the GPU.
 See `docs/architecture.md` for how the pipeline works.
 
+**[Read the research report](docs/research-paper.md)** — a longer,
+paper-structured writeup of the compiler architecture, the full capability
+surface, a controlled roofline-model demonstration on Apple Silicon (an
+identical stencil's memory-access pattern degrades under 100x scaling in
+one arithmetic-intensity regime and improves 13x+ in another), and a full,
+undiscarded account of a compiler fix that passed 500 randomized tests and
+the entire suite before being found to silently miscompile a real
+production kernel and fully reverted. Includes an explicit scope statement
+on what this document is and is not.
+
 ## Status: alpha / MVP
 
 This project is an early, deliberately narrow-scope MVP. It supports one
