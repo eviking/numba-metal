@@ -3,7 +3,8 @@
 Compatibility matrix for the current MVP. Status values:
 
 - **Supported** -- implemented, tested, and used by at least one of the
-  five benchmark kernels or the test suite.
+  benchmark kernels (nine in `benchmarks/*.py` as of this writing) or the
+  test suite.
 - **Partially supported** -- works with a documented restriction or
   caveat.
 - **Unsupported** -- explicitly rejected at compile time with a specific

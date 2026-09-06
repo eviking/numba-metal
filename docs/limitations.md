@@ -85,7 +85,7 @@ gap, not evidence it works.
   `tests/integration/test_device_functions.py`); this was measured on
   `benchmarks/heat_diffusion.py`'s stencil (factoring the 4-neighbor
   sum into a device function taking `cur` directly): correct, but the
-  non-inlined MSL function call costs a real, consistent 2.3-2.6x
+  non-inlined MSL function call costs a real, consistent ~1.9-2.4x
   per-iteration slowdown on an Apple M4 Pro -- not free, and not
   recommended for code this small and this hot; see that benchmark's
   module docstring ("Round 3") for the full numbers. There is no
