@@ -18,9 +18,14 @@ from numba_metal.advisor.models import (
     MeasurementMode,
     RecommendationDirection,
     RegimeComparison,
+    RooflineClassification,
+    RooflinePerformanceRegime,
     TimingStats,
 )
-from numba_metal.advisor.recommendations import generate_recommendations
+from numba_metal.advisor.recommendations import (
+    generate_recommendations,
+    recommend_from_roofline,
+)
 
 
 def _candidate(name: str = "simulate") -> Candidate:
@@ -211,6 +216,153 @@ def test_low_runtime_share_recommendation():
     rec = next(r for r in recs if r.rule_id == "low_runtime_share")
     assert "2.0%" in rec.text
     assert "cannot materially improve" in rec.text
+
+
+def _comparison_with_roofline(
+    *, cpu_ns: int, metal_ns: int, roofline: RooflineClassification, n: int = 7
+) -> ComparisonResult:
+    base = _comparison(cpu_ns=cpu_ns, metal_ns=metal_ns, n=n)
+    return ComparisonResult(
+        qualified_name=base.qualified_name,
+        file=base.file,
+        line_start=base.line_start,
+        regimes=base.regimes,
+        whole_program_speedup=base.whole_program_speedup,
+        whole_program_preliminary=base.whole_program_preliminary,
+        warmup_runs=base.warmup_runs,
+        measurement_runs=base.measurement_runs,
+        profiler_overhead_ns=base.profiler_overhead_ns,
+        bytes_per_call=1024,
+        flops_per_call=2048,
+        roofline=roofline,
+    )
+
+
+def test_no_roofline_classification_produces_no_roofline_recommendations():
+    """No bytes_per_call/flops_per_call supplied (or no calibration) means
+    ComparisonResult.roofline is None -- must produce nothing, never a
+    guessed explanation."""
+    candidate = _candidate()
+    comparison = _comparison(cpu_ns=1_000, metal_ns=10_000)
+    assert comparison.roofline is None
+    assert recommend_from_roofline(candidate, comparison) == []
+
+
+def test_dispatch_bound_recommends_trying_batch():
+    candidate = _candidate()
+    roofline = RooflineClassification(
+        regime=RooflinePerformanceRegime.DISPATCH_BOUND,
+        arithmetic_intensity_flops_per_byte=2.0,
+        dispatch_overhead_fraction=0.62,
+        achieved_bandwidth_gbps=10.0,
+        bandwidth_ceiling_fraction=0.05,
+        achieved_gflops=5.0,
+        compute_ceiling_fraction=0.01,
+        calibration_device_name="Apple M-series (test)",
+    )
+    comparison = _comparison_with_roofline(
+        cpu_ns=1_000, metal_ns=10_000, roofline=roofline
+    )
+    recs = recommend_from_roofline(candidate, comparison)
+    rule_ids = [r.rule_id for r in recs]
+    assert "roofline_dispatch_bound" in rule_ids
+    assert "roofline_dispatch_bound_try_batching" in rule_ids
+    batching_rec = next(
+        r for r in recs if r.rule_id == "roofline_dispatch_bound_try_batching"
+    )
+    assert "metal.batch()" in batching_rec.text
+    assert batching_rec.direction == RecommendationDirection.INFO_ONLY
+    dispatch_rec = next(r for r in recs if r.rule_id == "roofline_dispatch_bound")
+    assert "62%" in dispatch_rec.text
+
+
+def test_compute_bound_explains_ceiling_fraction():
+    candidate = _candidate()
+    roofline = RooflineClassification(
+        regime=RooflinePerformanceRegime.COMPUTE_BOUND,
+        arithmetic_intensity_flops_per_byte=50.0,
+        dispatch_overhead_fraction=0.01,
+        achieved_bandwidth_gbps=50.0,
+        bandwidth_ceiling_fraction=0.2,
+        achieved_gflops=650.0,
+        compute_ceiling_fraction=0.95,
+        calibration_device_name="Apple M-series (test)",
+    )
+    comparison = _comparison_with_roofline(
+        cpu_ns=800_000, metal_ns=100_000, roofline=roofline
+    )
+    recs = recommend_from_roofline(candidate, comparison)
+    assert len(recs) == 1
+    assert recs[0].rule_id == "roofline_compute_bound"
+    assert "95%" in recs[0].text
+    assert recs[0].direction == RecommendationDirection.INFO_ONLY
+
+
+def test_bandwidth_bound_explains_ceiling_fraction():
+    candidate = _candidate()
+    roofline = RooflineClassification(
+        regime=RooflinePerformanceRegime.BANDWIDTH_BOUND,
+        arithmetic_intensity_flops_per_byte=1.0,
+        dispatch_overhead_fraction=0.02,
+        achieved_bandwidth_gbps=66.3,
+        bandwidth_ceiling_fraction=0.3,
+        achieved_gflops=66.3,
+        compute_ceiling_fraction=0.1,
+        calibration_device_name="Apple M-series (test)",
+    )
+    comparison = _comparison_with_roofline(
+        cpu_ns=800_000, metal_ns=100_000, roofline=roofline
+    )
+    recs = recommend_from_roofline(candidate, comparison)
+    assert len(recs) == 1
+    assert recs[0].rule_id == "roofline_bandwidth_bound"
+    assert "30%" in recs[0].text
+
+
+def test_cache_bound_is_reported_not_treated_as_error():
+    candidate = _candidate()
+    roofline = RooflineClassification(
+        regime=RooflinePerformanceRegime.CACHE_BOUND,
+        arithmetic_intensity_flops_per_byte=1.0,
+        dispatch_overhead_fraction=0.02,
+        achieved_bandwidth_gbps=280.0,
+        bandwidth_ceiling_fraction=1.265,
+        achieved_gflops=280.0,
+        compute_ceiling_fraction=0.4,
+        calibration_device_name="Apple M-series (test)",
+    )
+    comparison = _comparison_with_roofline(
+        cpu_ns=800_000, metal_ns=100_000, roofline=roofline
+    )
+    recs = recommend_from_roofline(candidate, comparison)
+    assert len(recs) == 1
+    assert recs[0].rule_id == "roofline_cache_bound"
+    assert "not an error" in recs[0].text
+
+
+def test_generate_recommendations_includes_roofline_rules():
+    """The top-level orchestration must actually call the roofline rule
+    when a comparison carries a roofline classification."""
+    candidate = _candidate()
+    roofline = RooflineClassification(
+        regime=RooflinePerformanceRegime.DISPATCH_BOUND,
+        arithmetic_intensity_flops_per_byte=2.0,
+        dispatch_overhead_fraction=0.7,
+        achieved_bandwidth_gbps=10.0,
+        bandwidth_ceiling_fraction=0.05,
+        achieved_gflops=5.0,
+        compute_ceiling_fraction=0.01,
+        calibration_device_name="Apple M-series (test)",
+    )
+    comparison = _comparison_with_roofline(
+        cpu_ns=1_000, metal_ns=10_000, roofline=roofline
+    )
+    recs = generate_recommendations(
+        candidate, comparison=comparison, correctness=_passing_correctness()
+    )
+    rule_ids = [r.rule_id for r in recs]
+    assert "roofline_dispatch_bound" in rule_ids
+    assert "roofline_dispatch_bound_try_batching" in rule_ids
 
 
 def test_recommendations_never_call_an_llm():

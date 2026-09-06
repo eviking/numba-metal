@@ -524,6 +524,82 @@ over a generic calibration number -- calibration exists to give a rough
 sense of scale (e.g. "is my array big enough that dispatch overhead
 won't dominate"), not to replace measuring your own code.
 
+## Roofline classification: why is it fast or slow?
+
+A bare speedup number ("2.3x faster") doesn't say whether a kernel is
+already near its ceiling or has real headroom left, and it doesn't say
+whether a loss is a fundamental mismatch or just per-launch overhead
+that a different calling pattern could fix. If you tell `compare` how
+much memory traffic and how many floating-point operations your kernel
+performs per call, it classifies the measured result against this
+machine's own `calibrate` ceilings and explains which one applies:
+
+```python
+return AdvisorWorkload(
+    qualified_name="my_workload.metal_kernel",
+    cpu_fn=run_cpu,
+    metal_warm_fn=run_metal_warm,
+    get_cpu_result=lambda: cpu_out,
+    get_metal_result=lambda: metal_out.copy_to_host(),
+    bytes_per_call=n * 8,   # bytes read + written per call, across all buffers
+    flops_per_call=n * 2,  # floating-point operations per call
+)
+```
+
+Both fields are optional and **never inferred or estimated by the
+advisor** -- there is no reliable static analysis for either quantity
+in general (a data-dependent loop trip count, for example, can only be
+known by you or by direct measurement, which this project does not
+attempt to do automatically). Omit either field if you don't know it;
+`compare` reports no classification rather than guessing one.
+
+When both are supplied and a local calibration exists, `compare`
+reports one of four regimes:
+
+- **DISPATCH_BOUND**: per-launch overhead (command buffer encode +
+  commit + `waitUntilCompleted()`) is a large share (over 30%) of the
+  measured time, regardless of arithmetic intensity. Verified directly:
+  this overhead is almost entirely the commit/wait round-trip through
+  the OS and GPU scheduler, not GPU execution -- and batching a
+  sequence of launches onto one command buffer with a single
+  synchronize cuts it by roughly 2.5-2.7x. When a kernel is classified
+  this way, `compare` also suggests trying `metal.batch()`:
+
+  ```python
+  with metal.batch():
+      for _ in range(iterations):
+          metal_kernel[blocks, threads](data)
+  metal.synchronize()
+  ```
+
+  This is a suggestion to try, not a guarantee -- it only helps when
+  your real usage calls the kernel repeatedly. A one-off call gets no
+  benefit from batching, since there's nothing to fuse onto the same
+  command buffer.
+- **COMPUTE_BOUND**: arithmetic intensity (FLOPs per byte) is above
+  this machine's roofline ridge point, so the real, measured
+  compute-bound ceiling applies. If utilization is already near 100%,
+  there's likely little left to gain from tuning alone.
+- **BANDWIDTH_BOUND**: arithmetic intensity is below the ridge point,
+  so memory bandwidth caps throughput, not arithmetic. A kernel well
+  under 100% of this ceiling may have a fixable memory-access pattern
+  (verified directly on a stencil kernel this project: restructuring
+  scattered reads to use threadgroup memory went from ~29% to ~92% of
+  this same ceiling). On Apple Silicon, CPU and GPU share the same
+  memory bandwidth pool, so a low-intensity kernel may still lose to
+  CPU even at 100% of this ceiling.
+- **CACHE_BOUND**: achieved bandwidth exceeds the calibrated DRAM
+  ceiling. This is a real, legitimate result, not a measurement error
+  -- it happens when a kernel's working set is small enough to be
+  served mostly from on-chip cache rather than round-tripping to DRAM
+  on every access. Verified directly: a pairwise-distance kernel with a
+  small, heavily-reused input set measured above the DRAM bandwidth
+  ceiling.
+
+Every roofline recommendation is `INFO_ONLY` -- it explains a
+measurement, it never overrides the correctness gate or turns a
+`KEEP_CPU` verdict into `USE_METAL` on its own.
+
 ## JSON schema
 
 `profile.json` (schema version 1) contains: a `schema_version` field, a

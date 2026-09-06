@@ -37,6 +37,8 @@ from numba_metal.advisor.models import (
     RecommendationDirection,
     RegimeComparison,
     Report,
+    RooflineClassification,
+    RooflinePerformanceRegime,
     SamplingResult,
     ScoreComponent,
     TimingStats,
@@ -166,6 +168,22 @@ def load_report(path: str | Path) -> Report:
             preliminary=r["preliminary"],
         )
 
+    def _roofline_from_dict(r: dict | None) -> RooflineClassification | None:
+        if r is None:
+            return None
+        return RooflineClassification(
+            regime=RooflinePerformanceRegime(r["regime"]),
+            arithmetic_intensity_flops_per_byte=r[
+                "arithmetic_intensity_flops_per_byte"
+            ],
+            dispatch_overhead_fraction=r["dispatch_overhead_fraction"],
+            achieved_bandwidth_gbps=r["achieved_bandwidth_gbps"],
+            bandwidth_ceiling_fraction=r["bandwidth_ceiling_fraction"],
+            achieved_gflops=r["achieved_gflops"],
+            compute_ceiling_fraction=r["compute_ceiling_fraction"],
+            calibration_device_name=r["calibration_device_name"],
+        )
+
     comparisons = tuple(
         ComparisonResult(
             qualified_name=c["qualified_name"],
@@ -177,6 +195,12 @@ def load_report(path: str | Path) -> Report:
             warmup_runs=c["warmup_runs"],
             measurement_runs=c["measurement_runs"],
             profiler_overhead_ns=c["profiler_overhead_ns"],
+            # .get(...) rather than [...]: reports saved before this
+            # roofline-classification feature existed have none of these
+            # keys at all, and must still load cleanly rather than KeyError.
+            bytes_per_call=c.get("bytes_per_call"),
+            flops_per_call=c.get("flops_per_call"),
+            roofline=_roofline_from_dict(c.get("roofline")),
         )
         for c in data.get("comparisons", [])
     )

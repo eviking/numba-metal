@@ -42,6 +42,24 @@ class AdvisorWorkload:
         measure a genuinely cold compilation (see comparison.py's
         `time_metal_cold`). Optional -- if either is None, no COLD
         regime is measured.
+    `bytes_per_call` / `flops_per_call`: the real memory traffic (bytes
+        read + written across all buffers, per single `metal_warm_fn`
+        invocation) and floating-point operation count the Metal kernel
+        actually performs per call, if you know them. Optional, and
+        NEVER inferred or estimated by the advisor itself -- there is
+        no reliable static analysis for either quantity in general (a
+        data-dependent loop trip count, for instance, can only be
+        known by the workload author or by direct measurement, which
+        this project does not attempt to do automatically). Supplying
+        both enables a roofline classification (dispatch-bound vs.
+        bandwidth-bound vs. compute-bound vs. cache-bound, compared
+        against this machine's own `numba-metal advisor calibrate`
+        ceilings) that explains WHY a measured speedup came out the way
+        it did, and lets `compare` recommend `metal.batch()` for
+        genuinely dispatch-bound workloads instead of only reporting a
+        bare number. Omit either field (leave at None) if you don't
+        know -- the advisor reports "no classification possible" rather
+        than guessing.
     """
 
     qualified_name: str
@@ -51,3 +69,5 @@ class AdvisorWorkload:
     get_metal_result: Callable[[], object] | None = None
     py_func_for_cold: Callable | None = None
     arg_types_for_cold: tuple | None = None
+    bytes_per_call: int | None = None
+    flops_per_call: int | None = None

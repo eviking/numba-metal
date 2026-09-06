@@ -32,6 +32,8 @@ from numba_metal.advisor.models import (
     ComparisonResult,
     MeasurementMode,
     RegimeComparison,
+    RooflineClassification,
+    RooflinePerformanceRegime,
     TimingStats,
 )
 
@@ -141,6 +143,103 @@ def time_metal_cold(
     return TimingStats.from_samples(samples)
 
 
+def classify_roofline(
+    *,
+    metal_median_ns: float,
+    bytes_per_call: int | None,
+    flops_per_call: int | None,
+) -> RooflineClassification | None:
+    """Classify one measured Metal launch against this machine's own
+    calibrated ceilings (`numba-metal advisor calibrate`), so a
+    recommendation can explain WHY a kernel is fast or slow instead of
+    only reporting a bare speedup number.
+
+    Returns None (never a guessed classification) when:
+    - bytes_per_call or flops_per_call was not supplied by the workload
+      (this project does not attempt to infer memory traffic or FLOP
+      counts from source -- see AdvisorWorkload's docstring), or
+    - no local calibration file exists yet.
+
+    The four regimes and the thresholds between them are not arbitrary:
+    - DISPATCH_BOUND fires when the calibrated dispatch-overhead floor
+      is itself a large share (>30%) of the measured time, regardless
+      of arithmetic intensity -- verified this session that this
+      overhead is almost entirely the commit()+waitUntilCompleted()
+      round-trip, not GPU execution, and that batching launches onto
+      one command buffer cuts it by roughly 2.5-2.7x (see
+      recommendations.py's batching rule, which this classification
+      feeds).
+    - Otherwise, arithmetic intensity (flops_per_call / bytes_per_call)
+      is compared against the calibrated roofline ridge point
+      (compute ceiling / bandwidth ceiling) to decide whether bandwidth
+      or compute is the binding constraint -- standard roofline-model
+      reasoning, using this machine's own measured ceilings rather than
+      published/theoretical hardware specs.
+    - CACHE_BOUND is reported instead of an impossible >100%-of-DRAM-
+      bandwidth figure when achieved bandwidth exceeds the calibrated
+      DRAM ceiling -- a real, legitimate result when a kernel's working
+      set is small enough to be served mostly from on-chip cache
+      (verified directly this session: pairwise distance with inputs
+      small enough to fit on-chip measured above the DRAM ceiling, and
+      tracing it back confirmed genuine cache reuse, not a measurement
+      error).
+    """
+    from numba_metal.advisor.calibration import calibration_path
+
+    if bytes_per_call is None or flops_per_call is None or bytes_per_call <= 0:
+        return None
+    if not calibration_path().exists():
+        return None
+
+    import json
+
+    calib = json.loads(calibration_path().read_text())
+    dispatch_overhead_ns = calib.get("dispatch_overhead_ns")
+    bw_ceiling_gbps = calib.get("memory_bandwidth_gbps")
+    compute_ceiling_gflops = calib.get("float32_gflops_compute_bound")
+    ridge = calib.get("roofline_ridge_flops_per_byte")
+    device_name = calib.get("device_name")
+
+    if metal_median_ns <= 0:
+        return None
+
+    arithmetic_intensity = flops_per_call / bytes_per_call
+    achieved_bw_gbps = bytes_per_call / (metal_median_ns / 1e9) / 1e9
+    achieved_gflops = flops_per_call / (metal_median_ns / 1e9) / 1e9
+
+    dispatch_frac = (
+        dispatch_overhead_ns / metal_median_ns
+        if dispatch_overhead_ns is not None
+        else None
+    )
+    bw_frac = achieved_bw_gbps / bw_ceiling_gbps if bw_ceiling_gbps else None
+    gflops_frac = (
+        achieved_gflops / compute_ceiling_gflops if compute_ceiling_gflops else None
+    )
+
+    if dispatch_frac is not None and dispatch_frac > 0.3:
+        regime = RooflinePerformanceRegime.DISPATCH_BOUND
+    elif ridge is not None and arithmetic_intensity >= ridge:
+        regime = RooflinePerformanceRegime.COMPUTE_BOUND
+    elif bw_frac is not None and bw_frac > 1.0:
+        regime = RooflinePerformanceRegime.CACHE_BOUND
+    elif bw_frac is not None:
+        regime = RooflinePerformanceRegime.BANDWIDTH_BOUND
+    else:
+        regime = RooflinePerformanceRegime.UNKNOWN
+
+    return RooflineClassification(
+        regime=regime,
+        arithmetic_intensity_flops_per_byte=arithmetic_intensity,
+        dispatch_overhead_fraction=dispatch_frac,
+        achieved_bandwidth_gbps=achieved_bw_gbps,
+        bandwidth_ceiling_fraction=bw_frac,
+        achieved_gflops=achieved_gflops,
+        compute_ceiling_fraction=gflops_frac,
+        calibration_device_name=device_name,
+    )
+
+
 def compare(
     *,
     qualified_name: str,
@@ -153,6 +252,8 @@ def compare(
     warmup_runs: int = DEFAULT_WARMUP_RUNS,
     measurement_runs: int = DEFAULT_MEASUREMENT_RUNS,
     steady_state_runs: int | None = None,
+    bytes_per_call: int | None = None,
+    flops_per_call: int | None = None,
 ) -> ComparisonResult:
     """Run whichever of COLD/WARM/STEADY_STATE regimes have the inputs
     needed to measure them (a caller with no `py_func_for_cold` simply
@@ -267,6 +368,23 @@ def compare(
     ) + sum(sum(r.metal.samples_ns) if r.metal else 0 for r in regimes)
     profiler_overhead_ns = max(0, profiler_overhead_ns - measured_ns)
 
+    # Same regime-preference order as whole_program_speedup above
+    # (STEADY_STATE, then WARM, never COLD) -- the roofline
+    # classification describes ongoing/repeated execution, and a cold
+    # compile's timing would misrepresent that.
+    roofline = None
+    for mode in (MeasurementMode.STEADY_STATE, MeasurementMode.WARM):
+        for r in regimes:
+            if r.mode == mode and r.metal is not None:
+                roofline = classify_roofline(
+                    metal_median_ns=r.metal.median_ns,
+                    bytes_per_call=bytes_per_call,
+                    flops_per_call=flops_per_call,
+                )
+                break
+        if roofline is not None:
+            break
+
     return ComparisonResult(
         qualified_name=qualified_name,
         file=file,
@@ -277,4 +395,7 @@ def compare(
         warmup_runs=warmup_runs,
         measurement_runs=measurement_runs,
         profiler_overhead_ns=profiler_overhead_ns,
+        bytes_per_call=bytes_per_call,
+        flops_per_call=flops_per_call,
+        roofline=roofline,
     )

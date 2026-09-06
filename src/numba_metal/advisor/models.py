@@ -403,6 +403,84 @@ class RegimeComparison:
         }
 
 
+class RooflinePerformanceRegime(StrEnum):
+    """Which real, hardware-calibrated ceiling actually applies to a
+    measured kernel. Never inferred from the speedup number alone -- a
+    kernel can lose to CPU while sitting at 95% of its own compute
+    ceiling (nothing left to gain from tuning) or lose while sitting at
+    30% of its bandwidth ceiling (real headroom exists, likely from a
+    fixable access pattern) or lose because per-launch dispatch cost
+    dominates a workload with almost no work per call (batching
+    launches, not algorithm changes, is the fix). These three cases
+    warrant three different recommendations, not one generic "it's
+    slower" message -- see recommendations.py's roofline-aware rule.
+
+    DISPATCH_BOUND: per-launch overhead (command buffer + encode +
+        commit + waitUntilCompleted round-trip) is a large fraction of
+        the measured time. Verified directly this session: a batched
+        sequence of launches on one command buffer, synced once, cuts
+        this from ~170-190us/call to ~69-95us/call -- a real ~2.5-2.7x
+        reduction -- because most of the unbatched cost is exactly this
+        round-trip, not GPU execution.
+    BANDWIDTH_BOUND: arithmetic intensity (FLOPs per byte moved) is
+        below this hardware's calibrated roofline ridge point, so
+        memory bandwidth caps achievable throughput, not arithmetic
+        throughput.
+    COMPUTE_BOUND: arithmetic intensity is above the ridge point, so
+        this hardware's real (not memory-bound-kernel-derived) compute
+        ceiling applies.
+    CACHE_BOUND: achieved bandwidth exceeds the calibrated DRAM ceiling
+        -- a real, legitimate result (not a measurement error) when a
+        kernel's working set is small enough to be reused heavily from
+        on-chip cache rather than round-tripping to DRAM on every
+        access; verified directly this session (pairwise distance with
+        a small, heavily-reused input set measured above the DRAM
+        bandwidth ceiling).
+    UNKNOWN: no bytes_per_call/flops_per_call was supplied by the
+        workload, so no classification can be made -- never guessed.
+    """
+
+    DISPATCH_BOUND = "DISPATCH_BOUND"
+    BANDWIDTH_BOUND = "BANDWIDTH_BOUND"
+    COMPUTE_BOUND = "COMPUTE_BOUND"
+    CACHE_BOUND = "CACHE_BOUND"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class RooflineClassification:
+    """The result of comparing one measured kernel launch against this
+    machine's own calibrated dispatch-overhead/bandwidth/compute
+    ceilings (from `numba-metal advisor calibrate`). Always evidence=
+    MEASURED for the inputs it's built from (a real timing, real
+    calibration numbers) -- but the classification itself is a model
+    applied to those measurements, so callers should treat regime as an
+    explanation of measured behavior, not a new independent measurement."""
+
+    regime: RooflinePerformanceRegime
+    arithmetic_intensity_flops_per_byte: float | None
+    dispatch_overhead_fraction: float | None
+    achieved_bandwidth_gbps: float | None
+    bandwidth_ceiling_fraction: float | None
+    achieved_gflops: float | None
+    compute_ceiling_fraction: float | None
+    calibration_device_name: str | None
+
+    def to_json_dict(self) -> dict:
+        return {
+            "regime": self.regime.value,
+            "arithmetic_intensity_flops_per_byte": (
+                self.arithmetic_intensity_flops_per_byte
+            ),
+            "dispatch_overhead_fraction": self.dispatch_overhead_fraction,
+            "achieved_bandwidth_gbps": self.achieved_bandwidth_gbps,
+            "bandwidth_ceiling_fraction": self.bandwidth_ceiling_fraction,
+            "achieved_gflops": self.achieved_gflops,
+            "compute_ceiling_fraction": self.compute_ceiling_fraction,
+            "calibration_device_name": self.calibration_device_name,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ComparisonResult:
     qualified_name: str
@@ -417,6 +495,19 @@ class ComparisonResult:
     """Estimated overhead this profiler itself added while measuring, per
     spec section 18's "The profiler must report its own estimated
     overhead." None when not measured (e.g. a pure static comparison)."""
+    bytes_per_call: int | None = None
+    """Bytes of memory traffic per Metal kernel launch, if the workload
+    author supplied it via AdvisorWorkload -- never inferred or guessed
+    from the kernel source, since that would require a reliable static
+    memory-traffic analysis this project does not have. None means no
+    roofline classification is possible, and none is claimed."""
+    flops_per_call: int | None = None
+    """Floating-point operations per Metal kernel launch, if supplied.
+    Same non-guessing rule as bytes_per_call."""
+    roofline: RooflineClassification | None = None
+    """Populated only when both bytes_per_call/flops_per_call were
+    supplied AND a local calibration file exists (`numba-metal advisor
+    calibrate`) -- never fabricated from defaults."""
 
     def to_json_dict(self) -> dict:
         return {
@@ -429,6 +520,9 @@ class ComparisonResult:
             "warmup_runs": self.warmup_runs,
             "measurement_runs": self.measurement_runs,
             "profiler_overhead_ns": self.profiler_overhead_ns,
+            "bytes_per_call": self.bytes_per_call,
+            "flops_per_call": self.flops_per_call,
+            "roofline": self.roofline.to_json_dict() if self.roofline else None,
         }
 
 

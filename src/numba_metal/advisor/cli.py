@@ -344,6 +344,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
         arg_types_for_cold=workload.arg_types_for_cold,
         warmup_runs=args.warmup_runs,
         measurement_runs=args.measurement_runs,
+        bytes_per_call=workload.bytes_per_call,
+        flops_per_call=workload.flops_per_call,
     )
 
     correctness = None
