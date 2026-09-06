@@ -8,6 +8,18 @@ no GPU RNG is implemented); the terminal-value aggregation (mean payoff,
 discounting) is also done on the CPU since numba-metal does not yet
 implement GPU-side reductions (see docs/limitations.md and
 docs/roadmap.md).
+
+`z` is a genuine 2D array (n_paths, n_steps) and is indexed with real 2D
+indexing (`z[p, step]`) on both the Metal kernel and the Numba-CPU
+reference, not a flattened 1D index (`z[p*n_steps+step]`) -- applied to
+both sides together, per the fair-comparison methodology used elsewhere
+in this benchmark suite (see heat_diffusion.py/mandelbrot.py). Measured
+result: this access pattern is a sequential, stride-1 sweep down one
+row per thread either way (row-major offset math `p*n_steps+step` is
+identical whether written as `z[p,step]` or by hand), so unlike
+Mandelbrot's spatial pixel grid or pairwise_distance's transposed-ish
+access, native 2D indexing here produced no measurable difference --
+confirmed by direct before/after timing, not assumed.
 """
 
 from __future__ import annotations
@@ -70,7 +82,7 @@ def _make_numba_cpu_impl(*, parallel: bool):
         for p in loop_range(n_paths):
             log_s = np.log(s0)
             for step in range(n_steps):
-                log_s = log_s + drift + diffusion * z[p * n_steps + step]
+                log_s = log_s + drift + diffusion * z[p, step]
             out[p] = np.exp(log_s)
 
     return numba_cpu_impl
@@ -85,7 +97,7 @@ def _make_metal_kernel():
         if p < out.size:
             log_s = math.log(s0)
             for step in range(n_steps):
-                log_s = log_s + drift + diffusion * z[p * n_steps + step]
+                log_s = log_s + drift + diffusion * z[p, step]
             out[p] = math.exp(log_s)
 
     return metal_kernel
@@ -119,13 +131,12 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
         result.numpy_ns = t_numpy.median_ns
         numpy_estimate = numpy_price()
 
-        z_flat = z.reshape(-1)
         out_cpu = np.empty(n_paths, dtype=np.float32)
 
         cpu_parallel = _make_numba_cpu_impl(parallel=True)
 
         def cpu_kernel_only():
-            cpu_parallel(z_flat, out_cpu, n_paths, n_steps, S0, K, R, SIGMA, T)
+            cpu_parallel(z, out_cpu, n_paths, n_steps, S0, K, R, SIGMA, T)
 
         cpu_kernel_only()  # warm up / compile
         t_cpu_par = time_repeated(cpu_kernel_only, warmup=1, repeats=3)
@@ -140,7 +151,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
         out_cpu_single = np.empty(n_paths, dtype=np.float32)
 
         def cpu_kernel_only_single():
-            cpu_single(z_flat, out_cpu_single, n_paths, n_steps, S0, K, R, SIGMA, T)
+            cpu_single(z, out_cpu_single, n_paths, n_steps, S0, K, R, SIGMA, T)
 
         cpu_kernel_only_single()  # warm up / compile
         t_cpu_single = run_single_threaded(
@@ -169,7 +180,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             diffusion = np.float32(SIGMA * np.sqrt(dt))
 
             metal_kernel = _make_metal_kernel()
-            d_z = metal.to_device(z_flat)
+            d_z = metal.to_device(z)
             d_out = metal.device_array(n_paths, np.float32)
             threads = 256
             blocks = (n_paths + threads - 1) // threads
@@ -199,7 +210,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             t_kernel_warm = time_repeated(kernel_launch, warmup=2, repeats=5)
             result.metal_kernel_only_warm_ns = t_kernel_warm.median_ns
 
-            t_h2d = time_repeated(lambda: metal.to_device(z_flat), warmup=1, repeats=5)
+            t_h2d = time_repeated(lambda: metal.to_device(z), warmup=1, repeats=5)
             result.metal_h2d_ns = t_h2d.median_ns
             t_d2h = time_repeated(lambda: d_out.copy_to_host(), warmup=1, repeats=5)
             result.metal_d2h_ns = t_d2h.median_ns

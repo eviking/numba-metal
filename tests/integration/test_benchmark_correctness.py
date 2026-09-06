@@ -80,14 +80,13 @@ def test_monte_carlo_paths_small() -> None:
     n_paths, n_steps = 64, 10
     rng = np.random.default_rng(1)
     z = rng.standard_normal((n_paths, n_steps)).astype(np.float32)
-    z_flat = z.reshape(-1)
 
     dt = mc.T / n_steps
     drift = np.float32((mc.R - 0.5 * mc.SIGMA * mc.SIGMA) * dt)
     diffusion = np.float32(mc.SIGMA * np.sqrt(dt))
 
     kernel = mc._make_metal_kernel()
-    d_z = metal.to_device(z_flat)
+    d_z = metal.to_device(z)
     d_out = metal.device_array(n_paths, np.float32)
     kernel[1, 128](d_z, d_out, np.int32(n_steps), np.float32(mc.S0), drift, diffusion)
     metal.synchronize()
@@ -95,7 +94,7 @@ def test_monte_carlo_paths_small() -> None:
 
     cpu_impl = mc._make_numba_cpu_impl(parallel=True)
     out_cpu = np.empty(n_paths, dtype=np.float32)
-    cpu_impl(z_flat, out_cpu, n_paths, n_steps, mc.S0, mc.K, mc.R, mc.SIGMA, mc.T)
+    cpu_impl(z, out_cpu, n_paths, n_steps, mc.S0, mc.K, mc.R, mc.SIGMA, mc.T)
 
     assert np.allclose(gpu_terminal, out_cpu, rtol=1e-3, atol=1e-3)
     assert np.all(gpu_terminal > 0)  # GBM prices are always positive

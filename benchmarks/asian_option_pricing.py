@@ -27,12 +27,20 @@ run -- not agreement with an analytic price like the European-call
 benchmark's Black-Scholes check.
 
 Measured on an Apple M4 Pro (see `if __name__` below for a fresh run):
-10.73x at 100,000 paths, climbing to 12.73x at 2,000,000 paths -- the
-strongest compute-bound result in this project's own benchmark suite,
-and already a double-digit win at the smallest size tested (no
-dispatch-bound loss region to cross, unlike the cyclist example, since
-500 accumulating steps per path is enough arithmetic to clear the
-dispatch-overhead floor even at the smallest size here).
+roughly 12x at 100,000 paths, climbing to roughly 13x at 2,000,000
+paths -- the strongest compute-bound result in this project's own
+benchmark suite, and already a double-digit win at the smallest size
+tested (no dispatch-bound loss region to cross, unlike the cyclist
+example, since 500 accumulating steps per path is enough arithmetic to
+clear the dispatch-overhead floor even at the smallest size here).
+
+`z` is a genuine 2D array (n_paths, n_steps), indexed with real 2D
+indexing (`z[p, step]`) on both the Metal kernel and the Numba-CPU
+reference rather than a flattened 1D index (`z[p*n_steps+step]`) --
+applied to both sides together, matching monte_carlo_paths.py's own
+conversion and its finding: a sequential, stride-1 per-thread sweep
+gains nothing measurable from native 2D indexing over manual flat-index
+arithmetic, since both compile to the same row-major offset math.
 """
 
 from __future__ import annotations
@@ -100,7 +108,7 @@ def _make_numba_cpu_impl(*, parallel: bool):
             log_s = np.log(s0)
             running_sum = np.float32(0.0)
             for step in range(n_steps):
-                log_s = log_s + drift + diffusion * z[p * n_steps + step]
+                log_s = log_s + drift + diffusion * z[p, step]
                 running_sum += np.exp(log_s)
             out[p] = running_sum / n_steps
 
@@ -117,7 +125,7 @@ def _make_metal_kernel():
             log_s = math.log(s0)
             running_sum = 0.0
             for step in range(n_steps):
-                log_s = log_s + drift + diffusion * z[p * n_steps + step]
+                log_s = log_s + drift + diffusion * z[p, step]
                 running_sum = running_sum + math.exp(log_s)
             out[p] = running_sum / n_steps
 
@@ -156,13 +164,12 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
         result.numpy_ns = t_numpy.median_ns
         numpy_estimate = numpy_price()
 
-        z_flat = z.reshape(-1)
         out_cpu = np.empty(n_paths, dtype=np.float32)
 
         cpu_parallel = _make_numba_cpu_impl(parallel=True)
 
         def cpu_kernel_only():
-            cpu_parallel(z_flat, out_cpu, n_paths, n_steps, S0, R, SIGMA, T)
+            cpu_parallel(z, out_cpu, n_paths, n_steps, S0, R, SIGMA, T)
 
         cpu_kernel_only()  # warm up / compile
         t_cpu_par = time_repeated(cpu_kernel_only, warmup=1, repeats=3)
@@ -177,7 +184,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
         out_cpu_single = np.empty(n_paths, dtype=np.float32)
 
         def cpu_kernel_only_single():
-            cpu_single(z_flat, out_cpu_single, n_paths, n_steps, S0, R, SIGMA, T)
+            cpu_single(z, out_cpu_single, n_paths, n_steps, S0, R, SIGMA, T)
 
         cpu_kernel_only_single()  # warm up / compile
         t_cpu_single = run_single_threaded(
@@ -199,7 +206,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             diffusion = np.float32(SIGMA * np.sqrt(dt))
 
             metal_kernel = _make_metal_kernel()
-            d_z = metal.to_device(z_flat)
+            d_z = metal.to_device(z)
             d_out = metal.device_array(n_paths, np.float32)
             threads = 256
             blocks = (n_paths + threads - 1) // threads
@@ -229,7 +236,7 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             t_kernel_warm = time_repeated(kernel_launch, warmup=2, repeats=5)
             result.metal_kernel_only_warm_ns = t_kernel_warm.median_ns
 
-            t_h2d = time_repeated(lambda: metal.to_device(z_flat), warmup=1, repeats=5)
+            t_h2d = time_repeated(lambda: metal.to_device(z), warmup=1, repeats=5)
             result.metal_h2d_ns = t_h2d.median_ns
             t_d2h = time_repeated(lambda: d_out.copy_to_host(), warmup=1, repeats=5)
             result.metal_d2h_ns = t_d2h.median_ns
