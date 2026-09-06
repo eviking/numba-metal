@@ -225,6 +225,84 @@ def metal_implied_vol(s0, k, price, out, r, t, tol, max_iter):
         out[idx] = sigma
 
 
+@metal.device_func
+def metal_normal_cdf(x):
+    """The same Abramowitz & Stegun 7.1.26 rational approximation
+    `metal_implied_vol` computes inline TWICE per while-iteration (once
+    for d1, once for d2) -- real, substantial per-call work (~15
+    arithmetic ops plus a `math.exp`, itself not cheap), unlike
+    heat_diffusion.py's 4-neighbor-sum device-function experiment (4
+    adds, called once per pixel per iteration). The hypothesis going in
+    was that more work per call would let factoring pay for its own
+    non-inlined-call overhead -- measured result (see
+    `metal_implied_vol_device_func` below and this file's `if __name__`):
+    it does NOT produce a clear runtime win, but it does NOT cost a
+    measurable regression either -- both variants land within normal
+    run-to-run noise of each other (roughly 1.15x-4.5x vs. CPU either
+    way, across n=10K-5M), unlike heat_diffusion.py's clear 2.3-2.6x
+    per-iteration slowdown for a much smaller helper. The real,
+    measured `@metal.device_func` win found this session is a
+    DIFFERENT mechanism entirely -- compile-time, not runtime, and
+    requiring reuse across multiple different kernels rather than many
+    calls within one -- see `benchmarks/device_function_compile_cache.py`.
+    """
+    sign = 1.0 if x >= 0.0 else -1.0
+    xx = abs(x) / 1.4142135623730951
+    tt = 1.0 / (1.0 + 0.3275911 * xx)
+    y = 1.0 - (
+        ((((1.061405429 * tt + -1.453152027) * tt) + 1.421413741) * tt + -0.284496736)
+        * tt
+        + 0.254829592
+    ) * tt * math.exp(-xx * xx)
+    return 0.5 * (1.0 + sign * y)
+
+
+@metal.jit
+def metal_implied_vol_device_func(s0, k, price, out, r, t, tol, max_iter):
+    """Identical Newton-Raphson solve to `metal_implied_vol`, but calling
+    `metal_normal_cdf` (a @metal.device_func) instead of inlining the
+    same ~15-line rational-approximation block twice per iteration."""
+    idx = metal.grid(1)
+    if idx < out.size:
+        S0 = s0[idx]
+        K = k[idx]
+        target = price[idx]
+        sigma = 0.3
+        it = 0
+        done = False
+        while it < max_iter and not done:
+            sqrt_t = math.sqrt(t)
+            d1 = (math.log(S0 / K) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
+            d2 = d1 - sigma * sqrt_t
+
+            ncdf_d1 = metal_normal_cdf(d1)
+            ncdf_d2 = metal_normal_cdf(d2)
+
+            price_est = S0 * ncdf_d1 - K * math.exp(-r * t) * ncdf_d2
+            vega = S0 * sqrt_t * math.exp(-0.5 * d1 * d1) / 2.5066282746310002
+            diff = price_est - target
+            if diff >= 0.0:
+                abs_diff = diff
+            else:
+                abs_diff = -diff
+
+            if abs_diff < tol or vega < 1e-6:
+                done = True
+            else:
+                step = diff / vega
+                if step > 5.0:
+                    step = 5.0
+                elif step < -5.0:
+                    step = -5.0
+                sigma = sigma - step
+                if sigma <= 0.001:
+                    sigma = 0.001
+                elif sigma >= 5.0:
+                    sigma = 5.0
+            it = it + 1
+        out[idx] = sigma
+
+
 def make_data(n, seed=42):
     # Near-the-money strikes only (0.85x-1.15x spot) -- see module
     # docstring for why deep in/out-of-the-money options are excluded.
@@ -263,6 +341,7 @@ if __name__ == "__main__":
         d_k = metal.to_device(k)
         d_price = metal.to_device(price)
         d_out = metal.device_array(n, np.float32)
+        d_out_device_func = metal.device_array(n, np.float32)
         threads = 256
         blocks = (n + threads - 1) // threads
 
@@ -279,14 +358,36 @@ if __name__ == "__main__":
             )
             metal.synchronize()
 
+        def launch_device_func():
+            metal_implied_vol_device_func[blocks, threads](
+                d_s0,
+                d_k,
+                d_price,
+                d_out_device_func,
+                np.float32(R),
+                np.float32(T),
+                np.float32(TOL),
+                np.int32(MAX_ITER),
+            )
+            metal.synchronize()
+
         launch()  # warmup/compile
         metal_ms = median_time(launch) * 1000
         metal_out = d_out.copy_to_host()
 
+        launch_device_func()  # warmup/compile
+        metal_device_func_ms = median_time(launch_device_func) * 1000
+        metal_device_func_out = d_out_device_func.copy_to_host()
+
         err = np.max(np.abs(out_cpu - metal_out))
         err_vs_true = np.max(np.abs(metal_out - true_sigma))
+        err_device_func = np.max(np.abs(metal_device_func_out - metal_out))
         print(
-            f"n={n:>9,}: CPU={cpu_ms:9.3f}ms  Metal={metal_ms:9.3f}ms  "
-            f"speedup={cpu_ms / metal_ms:6.2f}x  cpu_vs_gpu_err={err:.2e}  "
+            f"n={n:>9,}: CPU={cpu_ms:9.3f}ms  Metal(inline)={metal_ms:9.3f}ms  "
+            f"Metal(device_func)={metal_device_func_ms:9.3f}ms  "
+            f"speedup(inline)={cpu_ms / metal_ms:6.2f}x  "
+            f"speedup(device_func)={cpu_ms / metal_device_func_ms:6.2f}x  "
+            f"cpu_vs_gpu_err={err:.2e}  "
+            f"device_func_vs_inline_err={err_device_func:.2e}  "
             f"recovered_vol_err={err_vs_true:.4f}"
         )

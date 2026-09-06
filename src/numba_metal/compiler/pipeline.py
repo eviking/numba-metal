@@ -136,7 +136,9 @@ def _compile_kernel(func, arg_types: tuple[nb_types.Type, ...]) -> CompiledKerne
     # during `lower()` (see MSLKernelLowerer._compile_device_function);
     # those must be declared/defined in the same compilation unit,
     # before the kernel body that calls them.
-    device_functions_src = "\n".join(lowerer.device_function_sources)
+    device_functions_src = "\n".join(
+        src for _key, src in lowerer.device_function_sources
+    )
     full_src = _MSL_PRELUDE + device_functions_src + body_src
 
     if os.environ.get("NUMBA_METAL_DUMP_MSL") == "1":

@@ -116,6 +116,98 @@ def test_device_function_called_from_two_different_kernels() -> None:
     assert np.allclose(d_out_b.copy_to_host(), a**3 + 1.0)
 
 
+def test_device_function_transitive_dependency_shared_across_kernels() -> None:
+    """A device function (`outer`) that itself calls another device
+    function (`inner`), called from two DIFFERENT kernels -- the second
+    kernel's compile hits the process-wide device-function compile cache
+    (see msl_backend.py's `_device_function_compile_cache`) for `outer`,
+    which must still splice `inner`'s MSL source into that second
+    kernel's own compiled output (a real bug found and fixed while
+    building this cache: caching only a device function's own body,
+    not its transitive dependencies, produced an 'undeclared identifier'
+    Metal shader-compile error for the second kernel)."""
+    metal = _metal()
+
+    @metal.device_func
+    def inner(x):
+        return x * 2.0
+
+    @metal.device_func
+    def outer(x):
+        return inner(x) + 1.0
+
+    @metal.jit
+    def kernel1(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = outer(a[i])
+
+    @metal.jit
+    def kernel2(a, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = outer(a[i]) + 100.0
+
+    a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    d_a = metal.to_device(a)
+    d_out1 = metal.device_array_like(a)
+    d_out2 = metal.device_array_like(a)
+    kernel1[1, 3](d_a, d_out1)
+    kernel2[1, 3](d_a, d_out2)  # hits the process-wide cache for `outer`
+    metal.synchronize()
+    assert np.allclose(d_out1.copy_to_host(), a * 2.0 + 1.0)
+    assert np.allclose(d_out2.copy_to_host(), a * 2.0 + 1.0 + 100.0)
+
+
+def test_device_function_diamond_dependency_across_kernels() -> None:
+    """Two device functions (`a_fn`, `b_fn`) sharing one common
+    dependency (`shared_c`), called together from two different kernels
+    -- the second kernel's compile hits the process-wide cache for BOTH
+    `a_fn` and `b_fn`, each of which independently lists `shared_c` as a
+    transitive dependency. This must not emit `shared_c`'s MSL function
+    definition twice in the second kernel's own compiled source (a real
+    bug found and fixed while building this cache: naively splicing
+    every cache hit's full transitive-dependency list, without checking
+    what this specific compile had already appended, produced a
+    duplicate MSL function definition -- tolerated silently by Metal's
+    compiler in testing, but not something to rely on)."""
+    metal = _metal()
+
+    @metal.device_func
+    def shared_c(x):
+        return x * 2.0
+
+    @metal.device_func
+    def a_fn(x):
+        return shared_c(x) + 1.0
+
+    @metal.device_func
+    def b_fn(x):
+        return shared_c(x) + 2.0
+
+    @metal.jit
+    def kernel1(x, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = a_fn(x[i]) + b_fn(x[i])
+
+    @metal.jit
+    def kernel2(x, out):
+        i = metal.grid(1)
+        if i < out.size:
+            out[i] = a_fn(x[i]) - b_fn(x[i])
+
+    xs = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    d_x = metal.to_device(xs)
+    d_out1 = metal.device_array_like(xs)
+    d_out2 = metal.device_array_like(xs)
+    kernel1[1, 3](d_x, d_out1)
+    kernel2[1, 3](d_x, d_out2)  # hits the process-wide cache for both
+    metal.synchronize()
+    assert np.allclose(d_out1.copy_to_host(), (xs * 2.0 + 1.0) + (xs * 2.0 + 2.0))
+    assert np.allclose(d_out2.copy_to_host(), (xs * 2.0 + 1.0) - (xs * 2.0 + 2.0))
+
+
 def test_device_function_calling_another_device_function() -> None:
     """Nested device functions: one device function calling another."""
     metal = _metal()

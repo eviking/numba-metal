@@ -54,6 +54,42 @@ Risk: low-medium (cache invalidation bugs are the classic failure mode;
 must be conservative about what counts as "the same kernel").
 Complexity: medium.
 
+**Cross-kernel `@metal.device_func` compile caching** -- done, in-
+process only (not persistent across process runs -- see the entry
+above for that separate, still-open item). A device function shared by
+multiple different kernels was, until this was built, independently
+re-lowered (Numba frontend + MSL codegen) once per calling kernel even
+though the generated MSL was byte-for-byte identical every time. Fixed
+via a module-level `_device_function_compile_cache` in `msl_backend.py`,
+keyed by `(py_func, arg_types)`, storing every transitively-needed
+source alongside each entry (not just the function's own body -- a
+cached function that itself calls another device function needs that
+callee's source spliced into the calling kernel too). Two real bugs
+were found and fixed while building this, both confirmed by dedicated
+tests before trusting any measurement: (1) caching only a function's
+own body, not its transitive dependencies, produced an "undeclared
+identifier" Metal shader-compile error for a second kernel calling an
+already-cached function that itself called a third, not-yet-seen-by-
+that-kernel function; (2) naively splicing a cache hit's full
+transitive-dependency list without checking what THIS compile had
+already appended produced a duplicate MSL function definition for a
+diamond dependency (two device functions sharing one common callee) --
+tolerated silently by Metal's shader compiler in testing, but not
+something to rely on. See `tests/integration/test_device_functions.py`'s
+`test_device_function_transitive_dependency_shared_across_kernels`/
+`test_device_function_diamond_dependency_across_kernels` for the
+regression tests these bugs produced, and
+`benchmarks/device_function_compile_cache.py` for the measured result:
+a real, reproducible 1.25x-1.89x cold-compile-time speedup (varies with
+system load) for 30 kernels sharing one device function, on an Apple
+M4 Pro, verified across repeated runs before committing (a first,
+buggy version of this cache measured a 0.92x -- a genuine LOSS -- and
+was not committed; see the module docstring in
+`benchmarks/device_function_compile_cache.py` for the two other,
+unsuccessful mechanisms tried first: varying calls-per-iteration and
+per-call body size, both of which stayed within +-15% of parity and
+were abandoned as non-wins).
+
 **Automated Apple-silicon testing (CI)** -- partially done: a Python
 3.12/3.13 matrix now runs lint, format check, and non-GPU unit tests on
 every push/PR (`.github/workflows/ci.yml`). The GPU-requiring job

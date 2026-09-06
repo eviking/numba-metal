@@ -67,7 +67,12 @@ benefit factoring it out provides. Kept in this file as an honest data
 point about when to reach for `@metal.device_func` (larger, less
 frequently called device functions; not a four-operand sum called once
 per pixel per iteration), not as a recommended rewrite of the
-production kernel above it.
+production kernel above it. This is a per-LAUNCH runtime cost -- a
+DIFFERENT, genuine win from `@metal.device_func` (compile-time, not
+runtime, and requiring the function to be reused across multiple
+different kernels rather than called many times within one) is
+measured in `benchmarks/device_function_compile_cache.py`; see that
+file for when the tradeoff goes the other way.
 """
 
 from __future__ import annotations

@@ -95,6 +95,43 @@ MATH_FUNCS = {"sqrt": "sqrt", "exp": "exp", "log": "log", "sin": "sin", "cos": "
 _device_function_name_counter = itertools.count()
 _device_function_name_lock = threading.Lock()
 
+#: Process-wide cache of already-compiled @metal.device_func bodies,
+#: keyed by (py_func, arg_types), shared across EVERY top-level kernel
+#: compilation -- not just within one kernel's own compile (that
+#: narrower, per-compile scope is `MSLKernelLowerer._device_function_
+#: cache`, used for in-progress/recursion tracking, which must stay
+#: scoped to a single kernel compile; see `_compile_device_function`'s
+#: docstring for why the two caches cannot be merged). Without this, a
+#: device function shared by N different kernels was measured to be
+#: independently re-lowered (Numba frontend + MSL codegen) N times, once
+#: per kernel, even though the resulting MSL is byte-for-byte identical
+#: every time. Entries are (msl_name, {cache_key: source_text, ...}) --
+#: a dict of EVERY transitively-needed (py_func, arg_types) -> source
+#: pair, not just this function's own body: a cached device function
+#: that itself calls another device function needs that callee's
+#: source spliced into the calling kernel too (confirmed by a real
+#: failure during development: caching only the top-level body produced
+#: an "undeclared identifier" Metal shader-compile error for a SECOND
+#: kernel calling an already-cached function that transitively called a
+#: third, never-yet-seen-by-that-kernel function). Keying the
+#: transitive-source map by cache_key (not just a flat list) lets
+#: `_compile_device_function` deduplicate correctly against a DIAMOND
+#: dependency within one kernel compile (two cache-hit device functions
+#: sharing one transitive dependency) -- a flat list was tried first and
+#: found, by direct testing, to duplicate that shared dependency's MSL
+#: function definition verbatim in the compiled source (Metal silently
+#: tolerated the duplicate in testing, but this is not something to
+#: rely on). The cached source must still be spliced into every calling
+#: kernel's own compiled MSL string (MSL has no cross-compilation-unit
+#: linking here -- see pipeline.py's `_compile_kernel`), so a cache hit
+#: skips only the compilation work, never the "this text must appear in
+#: this kernel's source" requirement.
+_device_function_compile_cache: dict[
+    tuple[object, tuple[nb_types.Type, ...]],
+    tuple[str, dict[tuple[object, tuple[nb_types.Type, ...]], str]],
+] = {}
+_device_function_compile_cache_lock = threading.Lock()
+
 
 def _next_device_function_name(func_name: str) -> str:
     with _device_function_name_lock:
@@ -344,8 +381,18 @@ class MSLKernelLowerer:
         # function is declared before its own body is emitted at the top
         # level, which this ordering naturally satisfies since a callee
         # is always fully compiled, by recursion, before its caller's own
-        # call-site code is emitted).
-        self.device_function_sources: list[str] = []
+        # call-site code is emitted). Each entry is (cache_key, source) --
+        # the key is needed so `_compile_device_function` can deduplicate
+        # against `self._device_function_cache` (whether a given
+        # transitive dependency's source has already been appended
+        # earlier in THIS kernel compile) when splicing in a process
+        # -wide compile-cache hit's own transitive dependencies, which
+        # can legitimately overlap with another call site's already
+        # -appended dependencies (a diamond: two device functions in the
+        # same kernel sharing one common dependency) -- see
+        # `_device_function_compile_cache`'s module-level docstring for
+        # the real duplicate-MSL-function-definition bug this prevents.
+        self.device_function_sources: list[tuple[object, str]] = []
         self.kernel_name = kernel_name
         self.typed = typed
         self.typemap = typed.typemap
@@ -1806,14 +1853,36 @@ class MSLKernelLowerer:
         self, py_func, arg_types: tuple[nb_types.Type, ...]
     ) -> str:
         """Recursively compile a `@metal.device_func`-wrapped `py_func`
-        at `arg_types` to a real, standalone MSL function (memoized by
-        `(py_func, arg_types)` in `self._device_function_cache`, shared
-        across this entire kernel compilation including transitively
-        -called device functions), returning the MSL function's name for
-        the caller to emit a normal call expression against. Detects
-        direct or transitive recursion and raises rather than recursing
-        into Python's own call stack (which would eventually hit
-        RecursionError, or worse, silently produce an infinite MSL
+        at `arg_types` to a real, standalone MSL function, returning the
+        MSL function's name for the caller to emit a normal call
+        expression against.
+
+        Two separate caches are consulted, deliberately not merged:
+
+        1. `self._device_function_cache` (per-kernel-compile, passed
+           down through recursive `MSLKernelLowerer` instances): tracks
+           "already compiled within THIS kernel's compile" plus
+           "currently in progress" (via a `None` sentinel), the latter
+           used to detect direct/transitive recursion. This must stay
+           scoped to one kernel compile -- two unrelated kernels calling
+           the same device function is not recursion, and marking it
+           "in progress" process-wide would make the second kernel's
+           compile spuriously think it found a cycle.
+        2. `_device_function_compile_cache` (module-level, process-wide,
+           `(py_func, arg_types) -> (msl_name, msl_source)`): skips
+           re-running the Numba frontend + MSL lowering entirely when
+           another kernel already compiled this exact device function at
+           this exact argument-type signature -- verified to matter:
+           without it, a device function shared by N kernels is
+           independently re-lowered N times even though the output is
+           byte-for-byte identical every time. A cache hit still splices
+           the cached source into THIS kernel's own compiled MSL text
+           (MSL has no cross-compilation-unit linking here), so it saves
+           compile time, not kernel source size.
+
+        Detects direct or transitive recursion and raises rather than
+        recursing into Python's own call stack (which would eventually
+        hit RecursionError, or worse, silently produce an infinite MSL
         function-emission loop for a mutually-recursive pair) --
         recursion is explicitly out of scope, matching numba-metal's
         existing "no recursion" restriction for kernels themselves.
@@ -1838,6 +1907,39 @@ class MSLKernelLowerer:
         # function -- is detected above instead of recursing forever.
         self._device_function_cache[cache_key] = None
 
+        with _device_function_compile_cache_lock:
+            process_wide_hit = _device_function_compile_cache.get(cache_key)
+        if process_wide_hit is not None:
+            name, transitive_sources = process_wide_hit
+            # `transitive_sources` may legitimately overlap with sources
+            # already appended earlier in THIS compile (a diamond: two
+            # device functions in the same kernel sharing one common
+            # dependency, where the FIRST one's compile -- cache hit or
+            # not -- already appended that shared dependency's source).
+            # Only append entries for cache_keys not yet resolved in
+            # `self._device_function_cache`, and mark each one resolved
+            # here too, so a LATER call site in this same compile (cache
+            # hit or not) sees it as already-present rather than
+            # appending it a second time.
+            for dep_key, dep_name, dep_src in transitive_sources:
+                # `cache_key` itself is already present here, but as the
+                # `None` "in progress" sentinel set just above (not yet
+                # the real name) -- checking plain membership would
+                # wrongly treat it as "already resolved, skip" and drop
+                # this function's OWN source (a real bug found by direct
+                # testing: a device function shared across two kernels,
+                # where the second kernel's call was a process-wide-cache
+                # hit, silently lost its own top-level MSL definition).
+                # Checking the VALUE distinguishes "in progress" (None,
+                # not yet resolved -- must still be appended) from
+                # "already resolved earlier in this compile" (a real
+                # name -- a genuine diamond-dependency skip).
+                if self._device_function_cache.get(dep_key) is None:
+                    self.device_function_sources.append((dep_key, dep_src))
+                    self._device_function_cache[dep_key] = dep_name
+            self._device_function_cache[cache_key] = name
+            return name
+
         typed = compile_to_typed_ir(py_func, arg_types, return_type=None)
         name = _next_device_function_name(getattr(py_func, "__name__", "device_func"))
         lowerer = MSLKernelLowerer(
@@ -1849,16 +1951,32 @@ class MSLKernelLowerer:
         )
         body_src = lowerer.lower()
         # Any device functions THIS device function itself called are
-        # already fully compiled (recursively) by the nested lowerer;
-        # splice their sources in before this function's own, so every
-        # callee is textually declared before its caller (not required
+        # already fully compiled (recursively) by the nested lowerer,
+        # which shares `self._device_function_cache` (see
+        # `device_function_cache=self._device_function_cache` above), so
+        # `lowerer.device_function_sources` only contains entries not
+        # already resolved earlier in this compile -- no re-check needed
+        # here, only for the process-wide-hit branch above (which never
+        # ran the nested lowerer, so has no such guarantee). Splice
+        # dependency sources in before this function's own (not required
         # by MSL/C at file scope for functions -- MSL does not require
         # forward declaration order for top-level function definitions
         # within one compiled source -- but keeping this ordering makes
         # the generated source readable top-to-bottom regardless).
-        self.device_function_sources.extend(lowerer.device_function_sources)
-        self.device_function_sources.append(body_src)
+        own_transitive_sources = [
+            *lowerer.device_function_sources,
+            (cache_key, body_src),
+        ]
+        self.device_function_sources.extend(own_transitive_sources)
         self._device_function_cache[cache_key] = name
+        with _device_function_compile_cache_lock:
+            _device_function_compile_cache[cache_key] = (
+                name,
+                [
+                    (k, self._device_function_cache[k], s)
+                    for k, s in own_transitive_sources
+                ],
+            )
         return name
 
     def _call(self, target_name: str, expr: ir.Expr) -> None:
