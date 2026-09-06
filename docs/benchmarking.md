@@ -130,7 +130,7 @@ dominates" (large):
 |---|---|
 | Vector polynomial | 10,000 / 1,000,000 / 10,000,000 elements |
 | Mandelbrot | 512² / 2048² / 4096² pixels |
-| Heat diffusion | 128² / 512² / 1024² grid, 200 Jacobi iterations |
+| Heat diffusion (nonlinear) | 128² / 512² / 1024² grid, 200 explicit-scheme iterations |
 | Monte Carlo paths | 10,000 / 200,000 / 2,000,000 paths x 100 time steps |
 | Pairwise distance | 200x200x8 / 2000x2000x8 / 5000x5000x16 |
 
@@ -208,41 +208,56 @@ any number below as illustrative of *what was actually measured once*,
 not a promised speedup. All 15 correctness checks passed on this run.
 Every `metal_cold_total_ns` figure below was confirmed via
 `compiled_before`/`compiled_after` to reflect a genuine fresh compilation
-(`compiled_before=0, compiled_after=1` in every row).
+(`compiled_before=0, compiled_after=1` in every row). Refreshed
+2026-09-06 after replacing the Heat diffusion benchmark's linear
+diffusion model with nonlinear (Perona-Malik) diffusion -- see
+`docs/performance-guidance.md`'s bandwidth-bound section for why.
 
 | Benchmark | Size | Numba CPU (par, N threads) | Numba CPU (1 thread) | Metal kernel-only (warm) | Metal cold (total) | vs Numba CPU (par) |
 |---|---|---|---|---|---|---|
-| Vector polynomial | 10,000 | 103.7us (12t) | 10.5us | 485.8us | 13.5ms | 0.21x |
-| Vector polynomial | 1,000,000 | 174.8us (12t) | 1.05ms | 743.7us | 10.8ms | 0.24x |
-| Vector polynomial | 10,000,000 | 763.2us (12t) | 10.41ms | 1.43ms | 15.6ms | 0.53x |
-| Mandelbrot | 512² | 2.42ms (12t) | 12.53ms | 904.3us | 15.7ms | 2.68x |
-| Mandelbrot | 2048² | 35.33ms (12t) | 197.5ms | 3.08ms | 75.9ms | 11.48x |
-| Mandelbrot | 4096² | 130.9ms (12t) | 787.7ms | 7.92ms | 48.5ms | 16.53x |
-| Heat diffusion | 128² (200 iters) | 19.61ms (12t) | 3.33ms | 187.5us/iter | 14.8ms | 104.60x |
-| Heat diffusion | 512² (200 iters) | 55.69ms (12t) | 400.3ms | 248.6us/iter | 17.3ms | 224.01x |
-| Heat diffusion | 1024² (200 iters) | 47.39ms (12t) | 217.1ms | 414.1us/iter | 29.4ms | 114.45x |
-| Monte Carlo paths | 10,000 | 242.5us (12t) | 819.2us | 359.9us | 17.6ms | 0.67x |
-| Monte Carlo paths | 200,000 | 2.12ms (12t) | 15.44ms | 1.94ms | 20.4ms | 1.09x |
-| Monte Carlo paths | 2,000,000 | 20.43ms (12t) | 154.2ms | 4.69ms | 233.0ms | 4.36x |
-| Pairwise distance | 200x200x8 | 98.4us (12t) | 61.3us | 527.7us | 21.4ms | 0.19x |
-| Pairwise distance | 2000x2000x8 | 1.87ms (12t) | 6.06ms | 2.60ms | 25.4ms | 0.72x |
-| Pairwise distance | 5000x5000x16 | 18.46ms (12t) | 65.88ms | 10.58ms | 46.7ms | 1.75x |
+| Vector polynomial | 10,000 | 107.0us (12t) | 9.33us | 164.2us | 14.6ms | 0.65x |
+| Vector polynomial | 1,000,000 | 185.8us (12t) | 964.2us | 258.2us | 8.69ms | 0.72x |
+| Vector polynomial | 10,000,000 | 674.8us (12t) | 10.0ms | 1.27ms | 11.6ms | 0.53x |
+| Mandelbrot | 512² | 2.04ms (12t) | 11.5ms | 236.5us | 14.2ms | 8.62x |
+| Mandelbrot | 2048² | 30.8ms (12t) | 178.5ms | 1.07ms | 15.5ms | 28.86x |
+| Mandelbrot | 4096² | 123.6ms (12t) | 743.6ms | 3.30ms | 18.6ms | 37.42x |
+| Heat diffusion (nonlinear) | 128² (200 iters) | 23.3ms (12t) | 27.1ms | 131.0us/iter | 18.8ms | 0.89x |
+| Heat diffusion (nonlinear) | 512² (200 iters) | 88.3ms (12t) | 438.0ms | 133.0us/iter | 20.1ms | 3.32x |
+| Heat diffusion (nonlinear) | 1024² (200 iters) | 297.8ms (12t) | 1.75s | 208.2us/iter | 20.9ms | 7.15x |
+| Monte Carlo paths | 10,000 | 255.4us (12t) | 688.2us | 221.2us | 6.70ms | 1.15x |
+| Monte Carlo paths | 200,000 | 2.44ms (12t) | 14.1ms | 742.1us | 8.24ms | 3.29x |
+| Monte Carlo paths | 2,000,000 | 20.3ms (12t) | 140.7ms | 4.60ms | 28.6ms | 4.41x |
+| Pairwise distance | 200x200x8 | 101.0us (12t) | 67.5us | 189.6us | 9.85ms | 0.53x |
+| Pairwise distance | 2000x2000x8 | 871.5us (12t) | 5.95ms | 525.2us | 8.24ms | 1.66x |
+| Pairwise distance | 5000x5000x16 | 9.95ms (12t) | 65.0ms | 4.28ms | 15.0ms | 2.32x |
 
-Note the two Heat diffusion rows and the smallest Vector polynomial row
-where single-threaded Numba CPU beats the "parallel" (12-thread) variant
--- `prange`'s thread-pool dispatch overhead exceeds the actual per-thread
-work at these small grid sizes, a real and expected effect, not an
-error. `metal_kernel_only_warm_ns` for Heat diffusion is reported
-per-iteration (`.../iter`) since it is measured across the full
-multi-iteration resident run, not a single launch.
+Heat diffusion's speedup varies more run-to-run than the other
+benchmarks at 1024² specifically (4.6x-7.2x observed across repeated
+runs, all with correctness verified) -- likely GPU clock/thermal
+state variance on a 200-iteration, many-small-launches workload; take
+it as a range, not the single value above. Also measured, at 10x and
+100x this benchmark's largest grid-point count (3238² and 10240²,
+outside `run_all.py`'s default sizes): **13.05x and 13.66x**, climbing
+rather than degrading as the grid grows -- see
+`docs/performance-guidance.md` for the full comparison against the
+retired linear-diffusion model, which did the opposite (0.52x and
+0.60x at the same two larger sizes).
+
+Note the smallest Vector polynomial row and Heat diffusion at 128²
+where single-threaded Numba CPU beats or nearly matches the "parallel"
+(12-thread) variant -- `prange`'s thread-pool dispatch overhead can
+exceed the actual per-thread work at small sizes, a real and expected
+effect, not an error. `metal_kernel_only_warm_ns` for Heat diffusion is
+reported per-iteration (`.../iter`) since it is measured across the
+full multi-iteration resident run, not a single launch.
 
 A machine-readable copy of this exact run is saved at
-`benchmarks/results/corrected_m4pro_<date>.json`. An earlier, differently
--structured results file (`benchmarks/results/example_m4pro_<date>.json`,
-predating the timing-category corrections described in this document) is
-kept for historical reference only -- its field names do not match the
-current `BenchmarkResult` schema and it should not be used for
-comparison.
+`benchmarks/results/benchmarking_doc_refresh_<date>.json`. Earlier,
+differently-structured results files (`benchmarks/results/corrected_
+m4pro_<date>.json`, `example_m4pro_<date>.json`, predating both the
+timing-category corrections described in this document and the
+heat-diffusion linear-to-nonlinear replacement) are kept for historical
+reference only and should not be used for comparison.
 
 ## Why some workloads can be slower on Metal
 
@@ -255,24 +270,27 @@ comparison.
   benchmark suite includes small sizes deliberately -- to show the
   crossover point, not to hide it.
 - **`prange` thread-pool overhead at small sizes.** The parallel Numba
-  CPU number is sometimes *slower* than the single-threaded one (Heat
-  diffusion at 128²/512²/1024² in the table above, all three sizes) --
-  spinning up and synchronizing 12 worker threads costs more than the
-  serial work saves when each thread's share of the loop is tiny relative
-  to thread-pool dispatch. This is reported directly via the separate
+  CPU number can be close to, or slower than, the single-threaded one
+  (Heat diffusion at 128² in the table above) -- spinning up and
+  synchronizing 12 worker threads costs more than the serial work saves
+  when each thread's share of the loop is tiny relative to thread-pool
+  dispatch. This is reported directly via the separate
   `numba_cpu_parallel_ns`/`numba_cpu_single_ns` columns rather than only
   showing whichever is faster.
 - **Many small launches instead of one large one.** `heat_diffusion.py`
-  at small grid sizes does 200 separate kernel launches (one Jacobi
-  iteration each); per-launch dispatch overhead can dominate over the
-  tiny amount of actual stencil computation per launch. The resident-vs-
-  copy-every-launch comparison (see above) isolates exactly how much of
-  that cost is host&harr;device transfer versus launch overhead itself.
-- **Mandelbrot's dramatic scaling** (2.68x at 512² up to 16.53x at 4096²)
-  demonstrates the opposite regime clearly: per-pixel divergent control
-  flow (variable iteration counts) is exactly the kind of workload GPUs
-  are built for once there's enough parallelism to hide the fixed launch
-  cost, and the M4 Pro's GPU core count dominates as pixel count grows.
+  at small grid sizes does 200 separate kernel launches (one diffusion
+  step each); per-launch dispatch overhead can dominate over the
+  actual stencil computation per launch, especially at 128² where
+  arithmetic intensity is real but the per-launch work is still small.
+  The resident-vs-copy-every-launch comparison (see above) isolates
+  exactly how much of that cost is host&harr;device transfer versus
+  launch overhead itself.
+- **Mandelbrot's dramatic scaling** (8.62x at 512² up to 37.42x at
+  4096²) demonstrates the opposite regime clearly: per-pixel divergent
+  control flow (variable iteration counts) is exactly the kind of
+  workload GPUs are built for once there's enough parallelism to hide
+  the fixed launch cost, and the M4 Pro's GPU core count dominates as
+  pixel count grows.
 - **The Mandelbrot correctness comparison** (see `docs/limitations.md`)
   required using a float32 CPU reference instead of Numba's default
   float64 inference, because a chaotic escape-time recurrence amplifies

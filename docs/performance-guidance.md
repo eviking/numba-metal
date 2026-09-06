@@ -169,6 +169,47 @@ workload is likely fundamentally memory-bound on this hardware; the fix, if
 one exists, is algorithmic (reduce memory traffic per output), not a
 Metal-side optimization.
 
+**Scaling a bandwidth-bound kernel up does not help, and can actively
+hurt.** With the fair, both-sides-2D-indexed linear-diffusion stencil
+above still only at parity (~1.0x) at 1024x1024, the natural next
+question was whether a MUCH larger grid would tip it in Metal's favor
+-- more total work per launch, amortizing fixed dispatch overhead
+further. Measured directly at 10x and 100x the grid-point count of
+1024x1024 (3238x3238 and 10240x10240, same 200 iterations, same
+GPU-resident methodology): Metal got WORSE, not better -- **0.52x and
+0.60x**, down from ~1.0x at 1024x1024. This makes sense once the
+bandwidth-bound diagnosis is taken seriously: bandwidth PRESSURE grows
+with grid size (more bytes moved per iteration), but the arithmetic
+per point does not, for a constant-coefficient stencil -- so there is
+no reason to expect scale alone to move a bandwidth-bound kernel
+toward a GPU win, and every reason to expect it to get worse as
+whatever fixed per-launch overhead advantage the GPU had gets diluted
+by a bandwidth ceiling neither side has a way to raise.
+
+**The actual fix: raise arithmetic intensity, not problem size.**
+`benchmarks/heat_diffusion.py` now solves NONLINEAR (Perona-Malik
+anisotropic) diffusion instead of the original linear model -- same
+4-neighbor memory-access pattern, but the diffusion coefficient at
+each point depends on the local gradient (`exp(-(gradient/kappa)^2)`,
+4 `math.exp` calls per point per iteration instead of one constant
+multiply), a real, physically-motivated increase in FLOPs per byte
+moved (this is literally the compute-bound-ridge lever described
+above, applied to a stencil instead of an elementwise/Monte-Carlo
+kernel). Measured on the same machine, same sizes, same methodology,
+correctness verified at every size against both a NumPy-vectorized and
+a scalar-CPU reference: 128x128 -> 0.90x, 512x512 -> 2.96x, 1024x1024
+-> **4.80x** (crossing the "great" threshold this project uses, where
+the linear version only reached parity), and -- the key result --
+10x/100x the grid-point count of 1024x1024 -> **13.05x and 13.66x**,
+getting BETTER as the grid grows, the exact opposite trend from linear
+diffusion. This is the clean confirmation of the diagnosis: the same
+access pattern that was bandwidth-bound and got worse at scale becomes
+compute-bound and gets better at scale, purely by adding real
+per-point arithmetic. The original linear-diffusion benchmark and its
+"roughly parity" finding are preserved in this file's git history and
+in the reasoning above; they remain true of THAT model, just no longer
+what `benchmarks/heat_diffusion.py` measures.
+
 ### Compute-bound: this is where numba-metal actually wins
 
 Above the ridge point, this machine's real, measured compute-bound ceiling
@@ -206,6 +247,23 @@ consistent:
   (`running_sum += price`) -- the same "more arithmetic per byte already
   moved" lever as the cyclist example, applied to a workload whose real-world
   version genuinely needs that much simulation.
+- **Nonlinear heat diffusion** (`benchmarks/heat_diffusion.py`, Perona-Malik
+  anisotropic diffusion): the one example in this list that is a STENCIL, not
+  an elementwise/Monte-Carlo kernel, and the one measured explicitly at BOTH
+  ordinary and 10x/100x-larger-than-ordinary problem sizes. Same 4-neighbor
+  memory-access pattern as the linear-diffusion version discussed above
+  (which stayed bandwidth-bound and got WORSE at 10x/100x scale, 0.52x and
+  0.60x), but the diffusion coefficient at each point now depends on the
+  local gradient (4 `math.exp` calls per point per iteration instead of one
+  constant multiply) -- real per-point arithmetic, same bytes moved.
+  Measured: 128x128 -> 0.90x, 512x512 -> 2.96x, 1024x1024 -> 4.80x, and at
+  10x/100x the grid-point count -> **13.05x and 13.66x**, improving as the
+  grid grows rather than degrading. This is the cleanest available
+  side-by-side demonstration in this suite that arithmetic intensity, not
+  problem size alone, determines which side of the roofline a kernel sits
+  on -- the identical memory-access pattern is bandwidth-bound-and-worsening
+  in one variant and compute-bound-and-improving in the other, with nothing
+  else changed.
 
 **The pattern across all these:** the win grows with problem size, because
 larger inputs mean more independent, embarrassingly-parallel work amortized
