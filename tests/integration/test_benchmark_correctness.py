@@ -42,13 +42,16 @@ def test_mandelbrot_small() -> None:
 
     width, height, max_iter = 16, 16, 30
     kernel = mb._make_metal_kernel()
-    d_out = metal.device_array(width * height, np.int32)
-    kernel[1, 256](d_out, np.int32(width), np.int32(height), np.int32(max_iter))
+    d_out = metal.device_array((height, width), np.int32)
+    blocks, threads = mb._launch_config(width, height)
+    kernel[blocks, threads](
+        d_out, np.int32(width), np.int32(height), np.int32(max_iter)
+    )
     metal.synchronize()
     result = d_out.copy_to_host()
 
     cpu_impl = mb._make_numba_cpu_impl(parallel=True)
-    out_cpu = np.empty(width * height, dtype=np.int32)
+    out_cpu = np.empty((height, width), dtype=np.int32)
     cpu_impl(out_cpu, width, height, max_iter)
     assert np.array_equal(result, out_cpu)
     assert result.min() >= 1
@@ -110,18 +113,22 @@ def test_pairwise_distance_small() -> None:
     expected = pd.numpy_impl(a, b)
 
     kernel = pd._make_metal_kernel()
-    d_a = metal.to_device(a.reshape(-1))
-    d_b = metal.to_device(b.reshape(-1))
-    d_out = metal.device_array(n_a * n_b, np.float32)
-    kernel[1, 64](d_a, d_b, d_out, np.int32(n_a), np.int32(n_b), np.int32(k))
+    d_a = metal.to_device(a)
+    d_b = metal.to_device(b)
+    d_out = metal.device_array((n_a, n_b), np.float32)
+    blocks, threads = pd._launch_config(n_a, n_b)
+    kernel[blocks, threads](d_a, d_b, d_out, np.int32(n_a), np.int32(n_b), np.int32(k))
     metal.synchronize()
-    result = d_out.copy_to_host().reshape(n_a, n_b)
+    result = d_out.copy_to_host()
 
     assert np.allclose(result, expected, rtol=1e-4, atol=1e-4)
     # Self-distance sanity check: distance(a[i], a[i]) via a==b should be ~0.
-    d_out_self = metal.device_array(n_a * n_a, np.float32)
-    d_a2 = metal.to_device(a.reshape(-1))
-    kernel[1, 64](d_a, d_a2, d_out_self, np.int32(n_a), np.int32(n_a), np.int32(k))
+    d_out_self = metal.device_array((n_a, n_a), np.float32)
+    d_a2 = metal.to_device(a)
+    blocks_self, threads_self = pd._launch_config(n_a, n_a)
+    kernel[blocks_self, threads_self](
+        d_a, d_a2, d_out_self, np.int32(n_a), np.int32(n_a), np.int32(k)
+    )
     metal.synchronize()
-    diag = d_out_self.copy_to_host().reshape(n_a, n_a).diagonal()
+    diag = d_out_self.copy_to_host().diagonal()
     assert np.allclose(diag, 0.0, atol=1e-5)

@@ -3,11 +3,14 @@ low-dimensional vectors.
 
     distance[i,j] = sum_k (a[i,k] - b[j,k])**2
 
-One GPU thread per (i, j) output element (a flattened 1D grid), each doing
-a small inner loop over the K dimensions -- exercises nested loops,
-multidimensional indexing (flattened), and moderate compute intensity per
-thread. Arrays are stored flattened (row-major) since numba-metal kernel
-arguments are 1D-only in this MVP.
+One GPU thread per (i, j) output element, launched as a genuine 2D grid
+(`metal.grid(2)`) over real 2D arrays (`a[i, d]`, `b[j, d]`, `out[i, j]`),
+not a flattened 1D thread index recovering (i, j) via `idx // n_b` /
+`idx % n_b` with manual `i*k+d` / `i*n_b+j` indexing -- on EITHER the GPU
+or CPU side, matching the fair, both-sides-together methodology used for
+heat_diffusion.py and mandelbrot.py (see those files' docstrings for the
+full account of why a one-sided conversion is not valid evidence of a
+real speedup).
 """
 
 from __future__ import annotations
@@ -31,6 +34,19 @@ from common import (
 
 # (n_a, n_b, k) problem sizes: two vector-set sizes and the dimensionality.
 SIZES = [(200, 200, 8), (2_000, 2_000, 8), (5_000, 5_000, 16)]
+
+#: 2D threadgroup shape, matching heat_diffusion.py/mandelbrot.py's TILE
+#: convention -- TILE x TILE = 256 threads per threadgroup, the same
+#: total occupancy as the previous 1D launch's 256-thread threadgroup.
+TILE = 16
+
+
+def _launch_config(
+    n_a: int, n_b: int, tile: int = TILE
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    blocks = ((n_a + tile - 1) // tile, (n_b + tile - 1) // tile)
+    threads = (tile, tile)
+    return blocks, threads
 
 
 def numpy_impl(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -72,9 +88,9 @@ def _make_numba_cpu_impl(*, parallel: bool):
             for j in range(n_b):
                 s = 0.0
                 for d in range(k):
-                    diff = a[i * k + d] - b[j * k + d]
+                    diff = a[i, d] - b[j, d]
                     s += diff * diff
-                out[i * n_b + j] = s
+                out[i, j] = s
 
     return numba_cpu_impl
 
@@ -84,16 +100,13 @@ def _make_metal_kernel():
 
     @metal.jit
     def metal_kernel(a, b, out, n_a, n_b, k):
-        idx = metal.grid(1)
-        total = n_a * n_b
-        if idx < total:
-            i = idx // n_b
-            j = idx % n_b
+        i, j = metal.grid(2)
+        if i < n_a and j < n_b:
             s = 0.0
             for d in range(k):
-                diff = a[i * k + d] - b[j * k + d]
+                diff = a[i, d] - b[j, d]
                 s = s + diff * diff
-            out[idx] = s
+            out[i, j] = s
 
     return metal_kernel
 
@@ -125,13 +138,11 @@ def run(
         t_numpy = time_repeated(lambda: numpy_impl(a, b), warmup=2, repeats=5)
         result.numpy_ns = t_numpy.median_ns
 
-        a_flat, b_flat = a.reshape(-1), b.reshape(-1)
-
         cpu_parallel = _make_numba_cpu_impl(parallel=True)
-        out_cpu = np.empty(n_a * n_b, dtype=np.float32)
-        cpu_parallel(a_flat, b_flat, out_cpu, n_a, n_b, k)
+        out_cpu = np.empty((n_a, n_b), dtype=np.float32)
+        cpu_parallel(a, b, out_cpu, n_a, n_b, k)
         t_cpu_par = time_repeated(
-            lambda: cpu_parallel(a_flat, b_flat, out_cpu, n_a, n_b, k),
+            lambda: cpu_parallel(a, b, out_cpu, n_a, n_b, k),
             warmup=2,
             repeats=5,
         )
@@ -139,16 +150,14 @@ def run(
         import numba
 
         result.numba_cpu_num_threads = numba.get_num_threads()
-        cpu_ok, cpu_note = assert_allclose(
-            out_cpu.reshape(n_a, n_b), expected, rtol=1e-3, atol=1e-3
-        )
+        cpu_ok, cpu_note = assert_allclose(out_cpu, expected, rtol=1e-3, atol=1e-3)
 
         cpu_single = _make_numba_cpu_impl(parallel=False)
-        out_cpu_single = np.empty(n_a * n_b, dtype=np.float32)
-        cpu_single(a_flat, b_flat, out_cpu_single, n_a, n_b, k)
+        out_cpu_single = np.empty((n_a, n_b), dtype=np.float32)
+        cpu_single(a, b, out_cpu_single, n_a, n_b, k)
         t_cpu_single = run_single_threaded(
             lambda: time_repeated(
-                lambda: cpu_single(a_flat, b_flat, out_cpu_single, n_a, n_b, k),
+                lambda: cpu_single(a, b, out_cpu_single, n_a, n_b, k),
                 warmup=2,
                 repeats=5,
             )
@@ -161,11 +170,10 @@ def run(
             # reused across every timed section below (cold, warm,
             # transfer) rather than freshly allocated per call, matching
             # how the CPU baselines reuse `out_cpu`/`out_cpu_single`.
-            d_a = metal.to_device(a_flat)
-            d_b = metal.to_device(b_flat)
-            d_out = metal.device_array(n_a * n_b, np.float32)
-            threads = 256
-            blocks = (n_a * n_b + threads - 1) // threads
+            d_a = metal.to_device(a)
+            d_b = metal.to_device(b)
+            d_out = metal.device_array((n_a, n_b), np.float32)
+            blocks, threads = _launch_config(n_a, n_b)
 
             def launch(kernel=None):
                 k_ = kernel or metal_kernel
@@ -197,7 +205,7 @@ def run(
                 result.metal_kernel_only_warm_ns + result.metal_d2h_ns
             )
 
-            gpu_result = d_out.copy_to_host().reshape(n_a, n_b)
+            gpu_result = d_out.copy_to_host()
             gpu_ok, gpu_note = assert_allclose(
                 gpu_result, expected, rtol=1e-3, atol=1e-3
             )

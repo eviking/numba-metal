@@ -6,6 +6,18 @@ iterations before `break`). Compares NumPy (vectorized, still does full
 max_iter work per pixel since divergent early-exit isn't expressible
 vectorized), Numba CPU (@njit, parallel over rows), and numba-metal.
 
+Launched as a genuine 2D grid (`metal.grid(2)`) over a real 2D output
+array (`out[py, px]`), not a flattened 1D thread index recovering (px,
+py) via `i % width` / `i // width` -- both the Metal kernel AND the
+Numba CPU reference are written this way, matching each other exactly.
+This is deliberate, learned from a real mistake made on a different
+benchmark (heat_diffusion.py): fixing only ONE side of a CPU-vs-Metal
+comparison to remove manual index-flattening measures the launch
+-configuration effect confounded with an unfair baseline, and can
+produce a speedup number that evaporates once the CPU side is fixed
+too. See docs/performance-guidance.md's bandwidth-bound section for
+the full account of that mistake and correction.
+
 An optional PNG output can be produced via `--save-image out.png` if
 Pillow is installed; the core package does not require Pillow.
 """
@@ -31,6 +43,19 @@ from common import (
 
 SIZES = [512, 2048, 4096]
 MAX_ITER = 100
+
+#: 2D threadgroup shape, matching heat_diffusion.py's TILE convention --
+#: TILE x TILE = 256 threads per threadgroup, the same total occupancy as
+#: the previous 1D launch's 256-thread threadgroup.
+TILE = 16
+
+
+def _launch_config(
+    width: int, height: int, tile: int = TILE
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    blocks = ((width + tile - 1) // tile, (height + tile - 1) // tile)
+    threads = (tile, tile)
+    return blocks, threads
 
 
 def numpy_impl(width: int, height: int, max_iter: int) -> np.ndarray:
@@ -69,22 +94,23 @@ def _make_numba_cpu_impl(*, parallel: bool):
     # comparison.
     @njit(parallel=parallel, fastmath=False, cache=True)
     def numba_cpu_impl(out, width, height, max_iter):
-        for idx in loop_range(width * height):
-            px = np.float32(idx % width)
-            py = np.float32(idx // width)
-            x0 = (px / np.float32(width)) * np.float32(3.5) - np.float32(2.5)
-            y0 = (py / np.float32(height)) * np.float32(2.0) - np.float32(1.0)
-            x = np.float32(0.0)
-            y = np.float32(0.0)
-            count = 0
-            for _ in range(max_iter):
-                if x * x + y * y > np.float32(4.0):
-                    break
-                xt = x * x - y * y + x0
-                y = np.float32(2.0) * x * y + y0
-                x = xt
-                count += 1
-            out[idx] = count
+        for py_i in loop_range(height):
+            py = np.float32(py_i)
+            for px_i in range(width):
+                px = np.float32(px_i)
+                x0 = (px / np.float32(width)) * np.float32(3.5) - np.float32(2.5)
+                y0 = (py / np.float32(height)) * np.float32(2.0) - np.float32(1.0)
+                x = np.float32(0.0)
+                y = np.float32(0.0)
+                count = 0
+                for _ in range(max_iter):
+                    if x * x + y * y > np.float32(4.0):
+                        break
+                    xt = x * x - y * y + x0
+                    y = np.float32(2.0) * x * y + y0
+                    x = xt
+                    count += 1
+                out[py_i, px_i] = count
         return out
 
     return numba_cpu_impl
@@ -95,11 +121,8 @@ def _make_metal_kernel():
 
     @metal.jit
     def metal_kernel(out, width, height, max_iter):
-        i = metal.grid(1)
-        n = width * height
-        if i < n:
-            px = i % width
-            py = i // width
+        px, py = metal.grid(2)
+        if px < width and py < height:
             x0 = (px / width) * 3.5 - 2.5
             y0 = (py / height) * 2.0 - 1.0
             x = 0.0
@@ -112,7 +135,7 @@ def _make_metal_kernel():
                 y = 2.0 * x * y + y0
                 x = xt
                 count = count + 1
-            out[i] = count
+            out[py, px] = count
 
     return metal_kernel
 
@@ -125,7 +148,7 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
 
     for size in sizes:
         width = height = size
-        expected = numpy_impl(width, height, max_iter).reshape(-1)
+        expected = numpy_impl(width, height, max_iter)
 
         result = BenchmarkResult(benchmark="Mandelbrot", size_label=f"{width}²")
 
@@ -135,7 +158,7 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
         result.numpy_ns = t_numpy.median_ns
 
         cpu_parallel = _make_numba_cpu_impl(parallel=True)
-        out_cpu = np.empty(width * height, dtype=np.int32)
+        out_cpu = np.empty((height, width), dtype=np.int32)
         cpu_parallel(out_cpu, width, height, max_iter)
         t_cpu_par = time_repeated(
             lambda: cpu_parallel(out_cpu, width, height, max_iter),
@@ -148,7 +171,7 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
         result.numba_cpu_num_threads = numba.get_num_threads()
 
         cpu_single = _make_numba_cpu_impl(parallel=False)
-        out_cpu_single = np.empty(width * height, dtype=np.int32)
+        out_cpu_single = np.empty((height, width), dtype=np.int32)
         cpu_single(out_cpu_single, width, height, max_iter)
         t_cpu_single = run_single_threaded(
             lambda: time_repeated(
@@ -172,9 +195,8 @@ def run(sizes: list[int] = SIZES, max_iter: int = MAX_ITER) -> list[BenchmarkRes
 
         if metal_available:
             metal_kernel = _make_metal_kernel()
-            d_out = metal.device_array(width * height, np.int32)
-            threads = 256
-            blocks = (width * height + threads - 1) // threads
+            d_out = metal.device_array((height, width), np.int32)
+            blocks, threads = _launch_config(width, height)
 
             def launch(kernel=None):
                 k = kernel or metal_kernel
@@ -232,14 +254,13 @@ def save_image(width: int, height: int, max_iter: int, path: str) -> None:
     from numba_metal import metal
 
     metal_kernel = _make_metal_kernel()
-    d_out = metal.device_array(width * height, np.int32)
-    threads = 256
-    blocks = (width * height + threads - 1) // threads
+    d_out = metal.device_array((height, width), np.int32)
+    blocks, threads = _launch_config(width, height)
     metal_kernel[blocks, threads](
         d_out, np.int32(width), np.int32(height), np.int32(max_iter)
     )
     metal.synchronize()
-    counts = d_out.copy_to_host().reshape(height, width)
+    counts = d_out.copy_to_host()
     normalized = (
         (counts.astype(np.float32) / max_iter * 255).clip(0, 255).astype(np.uint8)
     )
