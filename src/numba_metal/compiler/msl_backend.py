@@ -447,29 +447,29 @@ class MSLKernelLowerer:
                 # (see dispatcher.py's `_infer_arg_type` and
                 # `_emit_signature` below for the matching runtime
                 # buffer-binding order and MSL `_dimN` parameters this
-                # relies on). `@metal.device_func` arguments remain
-                # restricted to 1D -- a device function takes a plain
-                # `device T*` pointer with no `_size`/`_dimN` companion
-                # buffers of its own (see
-                # `_emit_device_function_signature`), so a multi-dim
-                # array would have no way to carry its shape across a
-                # device-function call boundary; not attempted here.
-                if ty.ndim > 3 or (self.device_function and ty.ndim != 1):
+                # relies on). `@metal.device_func` arguments now also
+                # support 1D/2D/3D: a multi-dim device-function array
+                # parameter gets its own `_dimN` companion parameters
+                # (plain `uint` by-value, not the `constant uint&`
+                # kernel-level binding, since a device function has no
+                # buffer index of its own to bind against -- see
+                # `_emit_device_function_signature`), threaded through
+                # from the caller's own `arg_{name}_dimN` at each call
+                # site (see `_call`). `_flat_index_expr` already reads
+                # `arg_{name}_dimN` by naming convention regardless of
+                # whether `name` is a kernel or device-function
+                # parameter, so no indexing-codegen change was needed.
+                if ty.ndim > 3:
                     kind = (
                         "@metal.device_func argument"
                         if self.device_function
                         else ("Kernel argument")
                     )
-                    detail = (
-                        "1D arrays only"
-                        if self.device_function
-                        else "1D, 2D, or 3D arrays"
-                    )
                     raise UnsupportedFeatureError(
                         f"{kind} {name!r} has {ty.ndim} dimensions; "
-                        f"numba-metal only supports {detail} here (use "
-                        "flattened indexing for anything else -- see "
-                        "docs/limitations.md)."
+                        "numba-metal only supports 1D, 2D, or 3D arrays "
+                        "here (use flattened indexing for anything else "
+                        "-- see docs/limitations.md)."
                     )
                 np_dtype = nb_scalar_dtype_to_numpy(ty.dtype)
                 self.sig.array_params.append(ArrayParamInfo(name, np_dtype, ty.ndim))
@@ -581,6 +581,18 @@ class MSLKernelLowerer:
                 msl_ty = numpy_dtype_to_msl(info.dtype)
                 params.append(f"device {msl_ty}* arg_{name}")
                 params.append(f"uint arg_{name}_size")
+                # One additional plain `uint` parameter per trailing
+                # dimension (shape[1], shape[2], ...) for ndim>1 arrays --
+                # mirrors _emit_signature's kernel-level `_dimN` companion
+                # parameters, but by-value rather than `constant uint&`
+                # (a device function has no buffer index of its own to
+                # bind a `constant` reference against; the caller passes
+                # the value straight through at the call site -- see
+                # `_call`). `_flat_index_expr` reads `arg_{name}_dimN` by
+                # naming convention, so this alone is enough to make
+                # multi-dim indexing work inside a device function body.
+                for dim in range(1, info.ndim):
+                    params.append(f"uint arg_{name}_dim{dim}")
                 continue
             _, ty = next(s for s in self.sig.scalar_params if s[0] == name)
             # Same float64->float32 narrowing as the return type below:
@@ -1863,18 +1875,30 @@ class MSLKernelLowerer:
             device_func_name = self._compile_device_function(
                 device_function_py_func(callee), arg_types
             )
-            # Every array-typed argument expands to two MSL call
-            # arguments (the `device T*` pointer plus its `_size`
-            # companion), matching _emit_device_function_signature's
-            # two-parameter-per-array emission -- an array argument is
-            # always a plain SSA variable reference here (arrays cannot
-            # be produced by an inline expression), so `a.name` is always
-            # a real typemap/array-name entry, never a temporary.
+            # Every array-typed argument expands to 2+ MSL call arguments
+            # (the `device T*` pointer, its `_size` companion, and one
+            # `_dimN` companion per trailing dimension for ndim>1),
+            # matching _emit_device_function_signature's per-array
+            # emission -- an array argument is always a plain SSA
+            # variable reference here (arrays cannot be produced by an
+            # inline expression), so `a.name` is always a real
+            # typemap/array-name entry, never a temporary. `arg_{a.name}
+            # _dimN` at THIS call site always names a real MSL value
+            # regardless of whether `a.name` is a top-level kernel array
+            # parameter or itself a forwarded array parameter of an
+            # enclosing device function -- both bind `arg_{name}_dimN`
+            # identifiers the same way (see _emit_signature/
+            # _emit_device_function_signature), so a multi-dim array can
+            # be forwarded transitively through nested device-function
+            # calls without special-casing which level it originated at.
             call_args = []
             for a, arg_expr in zip(expr.args, args, strict=True):
                 call_args.append(arg_expr)
                 if a.name in self._array_names:
                     call_args.append(f"arg_{a.name}_size")
+                    ndim = self.typemap[a.name].ndim
+                    for dim in range(1, ndim):
+                        call_args.append(f"arg_{a.name}_dim{dim}")
             self._assign(target_name, f"{device_func_name}({', '.join(call_args)})")
             return
 

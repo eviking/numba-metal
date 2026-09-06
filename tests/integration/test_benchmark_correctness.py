@@ -72,6 +72,25 @@ def test_heat_diffusion_small() -> None:
     assert np.array_equal(result[:, 0], grid[:, 0])
 
 
+def test_heat_diffusion_device_func_variant_matches_inline() -> None:
+    """The @metal.device_func variant (neighbor_sum factored out, taking
+    the 2D `cur` array directly) must produce the same result as the
+    inline stencil -- see heat_diffusion.py's module docstring, "Round
+    3", for the honest per-iteration timing comparison between the two
+    (the device-function call has real, measured overhead; this test is
+    about correctness, not performance)."""
+    import heat_diffusion as hd
+
+    grid = hd._initial_grid(16)
+    result = hd._metal_resident(
+        grid, iterations=20, make_kernel=hd._make_metal_kernel_device_func
+    )
+    expected = hd.numpy_impl(grid, iterations=20)
+    assert np.allclose(result, expected, rtol=1e-2, atol=1e-2)
+    assert np.array_equal(result[0, :], grid[0, :])
+    assert np.array_equal(result[:, 0], grid[:, 0])
+
+
 def test_monte_carlo_paths_small() -> None:
     import monte_carlo_paths as mc
 

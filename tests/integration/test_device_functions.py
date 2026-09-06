@@ -408,30 +408,127 @@ def test_device_function_atomic_compare_exchange_cas_loop_under_contention() -> 
     np.testing.assert_array_equal(result, expected)
 
 
-def test_device_function_rejects_2d_array_argument() -> None:
-    """The array-argument restriction narrows from "no arrays at all" to
-    "1D arrays only", matching the exact restriction kernel arguments
-    already have -- a 2D (or higher) array argument must still be
-    rejected, with the same UnsupportedFeatureError kernels raise for
-    the same shape violation."""
-    from numba_metal.errors import NumbaMetalError
-
+def test_device_function_accepts_2d_array_argument() -> None:
+    """2D array arguments to @metal.device_func: a multi-dim
+    device-function array parameter gets its own `_dimN` companion
+    parameters (see msl_backend.py's `_emit_device_function_signature`),
+    threaded through from the caller's own `arg_{name}_dimN` at the
+    call site -- exercises a real spatial (stencil-style) access
+    pattern, the exact shape heat_diffusion.py/mandelbrot.py's own 2D
+    conversion targeted, factored into a reusable helper."""
     metal = _metal()
 
     @metal.device_func
-    def bad(arr):
-        return arr[0, 0]
+    def neighbor_sum(grid, x, y):
+        return grid[x - 1, y] + grid[x + 1, y] + grid[x, y - 1] + grid[x, y + 1]
 
     @metal.jit
-    def kernel(a, out):
-        i = metal.grid(1)
-        if i < out.size:
-            out[i] = bad(a)
+    def kernel(cur, out, n, m):
+        x, y = metal.grid(2)
+        if x < n and y < m:
+            if 1 <= x < n - 1 and 1 <= y < m - 1:
+                out[x, y] = 0.25 * neighbor_sum(cur, x, y)
+            else:
+                out[x, y] = cur[x, y]
 
-    d_a = metal.to_device(np.zeros((2, 2), dtype=np.float32))
-    d_out = metal.device_array_like(np.array([1.0, 2.0], dtype=np.float32))
-    with pytest.raises(NumbaMetalError):
-        kernel[1, 2](d_a, d_out)
+    n = 8
+    grid = np.zeros((n, n), dtype=np.float32)
+    grid[3:5, 3:5] = 100.0
+    d_cur = metal.to_device(grid)
+    d_out = metal.device_array_like(grid)
+    kernel[(1, 1), (n, n)](d_cur, d_out, np.int32(n), np.int32(n))
+    metal.synchronize()
+    result = d_out.copy_to_host()
+
+    expected = grid.copy()
+    expected[1:-1, 1:-1] = 0.25 * (
+        grid[:-2, 1:-1] + grid[2:, 1:-1] + grid[1:-1, :-2] + grid[1:-1, 2:]
+    )
+    assert np.allclose(result, expected)
+
+
+def test_device_function_accepts_3d_array_argument() -> None:
+    metal = _metal()
+
+    @metal.device_func
+    def get3d(a, x, y, z):
+        return a[x, y, z]
+
+    @metal.jit
+    def kernel(a, out, nx, ny, nz):
+        x, y, z = metal.grid(3)
+        if x < nx and y < ny and z < nz:
+            out[x, y, z] = get3d(a, x, y, z) * 2.0
+
+    nx, ny, nz = 4, 5, 6
+    a = np.arange(nx * ny * nz, dtype=np.float32).reshape(nx, ny, nz)
+    d_a = metal.to_device(a)
+    d_out = metal.device_array_like(a)
+    kernel[(1, 1, 1), (nx, ny, nz)](
+        d_a, d_out, np.int32(nx), np.int32(ny), np.int32(nz)
+    )
+    metal.synchronize()
+    assert np.allclose(d_out.copy_to_host(), a * 2.0)
+
+
+def test_device_function_multidim_array_forwarded_to_nested_call() -> None:
+    """A 2D array argument threaded through one device function into
+    another -- mirrors
+    test_device_function_array_argument_forwarded_to_nested_call but for
+    a multi-dim array, exercising that the `_dimN` companion arguments
+    (not just the pointer+size pair) are forwarded correctly at a
+    device-function-to-device-function call site, not only from a
+    kernel."""
+    metal = _metal()
+
+    @metal.device_func
+    def inner_read(arr, x, y):
+        return arr[x, y]
+
+    @metal.device_func
+    def outer_read_plus_one(arr, x, y):
+        return inner_read(arr, x, y) + 1.0
+
+    @metal.jit
+    def kernel(arr, out, n, m):
+        x, y = metal.grid(2)
+        if x < n and y < m:
+            out[x, y] = outer_read_plus_one(arr, x, y)
+
+    n, m = 3, 4
+    arr = np.arange(n * m, dtype=np.float32).reshape(n, m)
+    d_arr = metal.to_device(arr)
+    d_out = metal.device_array_like(arr)
+    kernel[(1, 1), (n, m)](d_arr, d_out, np.int32(n), np.int32(m))
+    metal.synchronize()
+    assert np.allclose(d_out.copy_to_host(), arr + 1.0)
+
+
+def test_device_function_rejects_4d_array_argument() -> None:
+    """4D+ remains unsupported, matching the exact restriction kernel
+    arguments already have (numba-metal only supports 1D/2D/3D
+    anywhere). A 4D device-function argument can never actually reach
+    `_classify_params`'s own check via a real kernel launch (the
+    top-level kernel-argument boundary already rejects a 4D array
+    earlier, in dispatcher.py's `_infer_arg_type`) -- this exercises
+    `_classify_params`'s device-function branch directly, the same way
+    test_atomics.py's `test_atomic_rejects_2d_array` isolates an
+    otherwise-unreachable-in-practice typing-level check."""
+    from numba.core import types
+
+    from numba_metal.compiler.frontend import compile_to_typed_ir
+    from numba_metal.compiler.msl_backend import MSLKernelLowerer
+    from numba_metal.errors import UnsupportedFeatureError
+
+    def bad(arr):
+        return arr[0, 0, 0, 0]
+
+    typed = compile_to_typed_ir(bad, (types.float32[:, :, :, ::1],), return_type=None)
+    lowerer = MSLKernelLowerer(
+        "bad", typed, device_function=True, return_type=typed.return_type
+    )
+    with pytest.raises(UnsupportedFeatureError):
+        lowerer.lower()
 
 
 def test_device_function_rejects_non_array_non_scalar_argument() -> None:

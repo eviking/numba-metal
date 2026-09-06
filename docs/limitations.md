@@ -42,9 +42,13 @@ gap, not evidence it works.
   `UnsupportedFeatureError`.
 - **Calling other Python functions from within a kernel is supported
   only via `@metal.device_func`** (a decorator, not calling an
-  arbitrary undecorated function). Scalar arguments and return type
-  only -- no arrays, no `metal.local_array`/`shared_array` inside a
-  device function. Direct recursion is rejected by Numba's own frontend
+  arbitrary undecorated function). Scalar arguments and return type,
+  and 1D/2D/3D array arguments of a supported dtype (forwarded from the
+  caller's own array, including transitively through nested
+  device-function calls) -- no `metal.local_array`/`shared_array`
+  inside a device function, and no array RETURN type (a device function
+  can only read/write a caller-provided array, never allocate or return
+  one of its own). Direct recursion is rejected by Numba's own frontend
   at typing time; mutual/transitive recursion between two device
   functions is rejected by numba-metal's own in-progress-compilation
   cycle detection. Each is compiled to a real, separate MSL function
@@ -73,10 +77,19 @@ gap, not evidence it works.
   `arr[x, y, z]` indexing with a matching `metal.grid(2)`/`metal.grid(3)`
   launch -- see `tests/integration/test_multidim_arrays.py` and
   `benchmarks/heat_diffusion.py`). 4D and beyond are not; flatten those
-  manually. `@metal.device_func` arguments remain 1D-only regardless of
-  what the calling kernel uses (a device function's array argument has no
-  `_dimN` companion parameters of its own -- see `msl_backend.py`'s
-  `_classify_params`), and there is no `.shape` attribute access inside a
+  manually. `@metal.device_func` array arguments also support 2D/3D
+  (each gets its own `_dimN` companion parameters, threaded through
+  from the caller's own binding at every call site, including
+  transitively through nested device-function calls -- see
+  `msl_backend.py`'s `_emit_device_function_signature`/`_call` and
+  `tests/integration/test_device_functions.py`); this was measured on
+  `benchmarks/heat_diffusion.py`'s stencil (factoring the 4-neighbor
+  sum into a device function taking `cur` directly): correct, but the
+  non-inlined MSL function call costs a real, consistent 2.3-2.6x
+  per-iteration slowdown on an Apple M4 Pro -- not free, and not
+  recommended for code this small and this hot; see that benchmark's
+  module docstring ("Round 3") for the full numbers. There is no
+  `.shape` attribute access inside a
   kernel body (only `.size`, the total flattened element count) -- read a
   dimension's size from a separately-passed scalar argument if a kernel
   needs it directly. Manual index-flattening (`arr[x*n+y]`) still works

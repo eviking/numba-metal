@@ -51,6 +51,23 @@ get subtly wrong (a transposed stride, an off-by-one in the row width)
 side of the comparison -- that motivated adding native
 multi-dimensional array support to numba-metal in the first place. See
 tests/integration/test_multidim_arrays.py and docs/limitations.md.
+
+Round 3: `_make_metal_kernel_device_func` factors the 4-neighbor sum
+into a `@metal.device_func` taking the 2D `cur` array directly
+(`neighbor_sum(cur, x, y)`) -- exercising multi-dimensional
+`@metal.device_func` array arguments, a capability the stencil itself
+motivated (see docs/limitations.md). Measured separately from the
+inline version at the same iteration count/launch config: the
+device-function call costs a real, consistent 2.3-2.6x per-iteration
+slowdown across all three sizes (118-131us/iter inline vs.
+305-320us/iter factored, on an Apple M4 Pro) -- a non-inlined MSL
+function call is not free, and this is small enough, hot-loop-enough
+code that the call overhead dominates whatever code-organization
+benefit factoring it out provides. Kept in this file as an honest data
+point about when to reach for `@metal.device_func` (larger, less
+frequently called device functions; not a four-operand sum called once
+per pixel per iteration), not as a recommended rewrite of the
+production kernel above it.
 """
 
 from __future__ import annotations
@@ -145,6 +162,36 @@ def _make_metal_kernel():
     return stencil_step
 
 
+def _make_metal_kernel_device_func():
+    """Same stencil as `_make_metal_kernel`, but the 4-neighbor sum is
+    factored into a `@metal.device_func` taking the 2D `cur` array
+    directly (`cur[x-1, y]` etc.) -- exercises multi-dimensional
+    `@metal.device_func` array arguments (see `docs/limitations.md`'s
+    entry on this), the exact code-organization benefit real 2D/3D
+    array support was missing for device functions: a spatial-stencil
+    helper could not previously take a 2D array without manually
+    flattening it and its shape at every call site. Kept as a SEPARATE
+    kernel (not a replacement for `_make_metal_kernel`) so `run()` can
+    measure both and report the device-function call overhead honestly,
+    rather than assuming factoring the neighbor-sum out is free."""
+    from numba_metal import metal
+
+    @metal.device_func
+    def neighbor_sum(grid, x, y):
+        return grid[x - 1, y] + grid[x + 1, y] + grid[x, y - 1] + grid[x, y + 1]
+
+    @metal.jit
+    def stencil_step(cur, nxt, n, m):
+        x, y = metal.grid(2)
+        if x < n and y < m:
+            if x >= 1 and x < n - 1 and y >= 1 and y < m - 1:
+                nxt[x, y] = 0.25 * neighbor_sum(cur, x, y)
+            else:
+                nxt[x, y] = cur[x, y]
+
+    return stencil_step
+
+
 def _launch_config(
     n: int, m: int, tile: int = TILE
 ) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -153,13 +200,13 @@ def _launch_config(
     return blocks, threads
 
 
-def _metal_resident(grid: np.ndarray, iterations: int):
+def _metal_resident(grid: np.ndarray, iterations: int, make_kernel=_make_metal_kernel):
     """Keep both buffers GPU-resident for the whole simulation; only
     transfer the initial grid in and the final grid out."""
     from numba_metal import metal
 
     n, m = grid.shape
-    stencil_step = _make_metal_kernel()
+    stencil_step = make_kernel()
     blocks, threads = _launch_config(n, m)
     d_cur = metal.to_device(grid)
     d_nxt = metal.device_array_like(grid)
@@ -291,14 +338,45 @@ def run(
             )
             copy_every_launch_ns = t_copy.median_ns
 
-            result.correctness_ok = cpu_ok and gpu_ok
-            result.correctness_note = f"cpu: {cpu_note}; gpu(resident): {gpu_note}"
+            # Device-function variant: the same stencil, but the 4
+            # -neighbor sum is factored into a @metal.device_func taking
+            # the 2D `cur` array directly (see
+            # `_make_metal_kernel_device_func`) -- measured separately,
+            # at the same iteration count and launch config, to report
+            # the real cost (or lack thereof) of a non-inlined device
+            # -function call honestly rather than assuming factoring
+            # code out is free.
+            t_resident_device_func = time_repeated(
+                lambda: _metal_resident(
+                    grid, iterations, make_kernel=_make_metal_kernel_device_func
+                ),
+                warmup=1,
+                repeats=3,
+            )
+            gpu_resident_device_func = _metal_resident(
+                grid, iterations, make_kernel=_make_metal_kernel_device_func
+            )
+            gpu_device_func_ok, gpu_device_func_note = assert_allclose(
+                gpu_resident_device_func, expected, rtol=1e-2, atol=1e-2
+            )
+
+            result.correctness_ok = cpu_ok and gpu_ok and gpu_device_func_ok
+            result.correctness_note = (
+                f"cpu: {cpu_note}; gpu(resident): {gpu_note}; "
+                f"gpu(device_func): {gpu_device_func_note}"
+            )
             result.extra["metal_copy_every_launch_total_ns"] = copy_every_launch_ns
             result.extra["metal_copy_every_launch_per_iter_ns"] = (
                 copy_every_launch_ns / iterations
             )
             result.extra["metal_resident_per_iter_ns"] = (
                 result.metal_resident_pipeline_ns / iterations
+            )
+            result.extra["metal_resident_device_func_ns"] = (
+                t_resident_device_func.median_ns
+            )
+            result.extra["metal_resident_device_func_per_iter_ns"] = (
+                t_resident_device_func.median_ns / iterations
             )
             result.extra["iterations"] = iterations
         else:
@@ -318,10 +396,18 @@ if __name__ == "__main__":
     for r in results:
         per_iter_copy = r.extra.get("metal_copy_every_launch_per_iter_ns")
         per_iter_resident = r.extra.get("metal_resident_per_iter_ns")
+        per_iter_device_func = r.extra.get("metal_resident_device_func_per_iter_ns")
         if per_iter_copy is not None:
             print(
                 f"{r.benchmark} {r.size_label}, {r.extra['iterations']} iters "
                 f"(same count for both): resident={format_ns(per_iter_resident)}/iter "
                 f"vs copy-every-launch={format_ns(per_iter_copy)}/iter "
                 "(per-iteration transfer cost dominates when data is not resident)"
+            )
+        if per_iter_device_func is not None:
+            print(
+                f"{r.benchmark} {r.size_label}: inline neighbor-sum="
+                f"{format_ns(per_iter_resident)}/iter vs factored into "
+                f"@metal.device_func={format_ns(per_iter_device_func)}/iter "
+                "(cost of a non-inlined 2D-array device-function call)"
             )

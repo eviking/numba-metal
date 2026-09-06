@@ -443,8 +443,10 @@ def device_func(func=None):
     typed, then recompiles the original plain function through its own
     pipeline to produce MSL (see `_DEVICE_FUNCTION_REGISTRY`).
 
-    Only scalar (int32/uint32/int64/float32/float16/bool) argument and
-    return types are supported; no array arguments, no
+    Scalar (int32/uint32/int64/float32/float16/bool) arguments and
+    return type are supported, and so are 1D/2D/3D array arguments of a
+    supported dtype (forwarded from the caller's own array argument --
+    a device function cannot allocate or return an array itself). No
     `metal.local_array`/`shared_array`, no recursion (calling a device
     function from within itself, directly or transitively, is rejected
     at compile time). See docs/supported-features.md.
