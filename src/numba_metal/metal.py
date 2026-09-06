@@ -28,6 +28,11 @@ from numba_metal.compiler.intrinsics import (  # noqa: F401 (re-exported)
     threadgroup_position,
     threads_per_threadgroup,
 )
+from numba_metal.reductions import (  # noqa: F401 (re-exported)
+    reduce_max,
+    reduce_min,
+    reduce_sum,
+)
 from numba_metal.runtime.array import (
     DeviceNDArray,
     device_array,
@@ -61,6 +66,9 @@ __all__ = [
     "atomic_max",
     "atomic_exchange",
     "atomic_compare_exchange",
+    "reduce_sum",
+    "reduce_min",
+    "reduce_max",
     "to_device",
     "device_array",
     "device_array_like",

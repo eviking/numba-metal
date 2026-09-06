@@ -78,20 +78,32 @@ Complexity: medium.
 
 ## Phase 2: Scientific-computing features
 
-**Reductions** (sum/min/max/argmax across a device array) -- the
-low-level primitives this depends on are now done (threadgroup memory,
-barriers, atomics; see below), but a dedicated multi-stage/tree
-reduction *helper* (as opposed to a hand-written single-threadgroup
-cooperative reduction, which `tests/integration/
-test_local_and_shared_memory.py` already demonstrates) is not yet
-built.
-User value: avoids the current pattern of downloading results and
-reducing on the CPU (as `monte_carlo_paths.py` does today, documented as
-a boundary in that benchmark).
-Dependency: threadgroup-memory support (done, see below).
+**Reductions** (sum/min/max across a device array) -- done, as a
+host-side helper (`metal.reduce_sum`/`reduce_min`/`reduce_max`, see
+`numba_metal/reductions.py`), not a new compiler intrinsic: it composes
+the existing threadgroup-memory/barrier/atomics primitives into a
+two-stage tree reduction (per-threadgroup partial via shared memory +
+one atomic per threadgroup to combine partials), verified correct for
+non-power-of-two sizes, single-element inputs, and repeated launches
+(`tests/integration/test_reductions.py`). `argmax` (returning the
+winning index, not just the value) is not implemented -- the atomic
+primitives this would need (`atomic_compare_exchange` on a packed
+value+index) exist, but no helper wraps them yet.
+User value: avoids the pattern of downloading results and reducing on
+the CPU. Applied to `monte_carlo_paths.py` (added a GPU-reduced payoff
+path alongside the original CPU-reduced one for a direct, honest
+comparison): measured on an Apple M4 Pro, the GPU-side reduction is
+*slower* at 10,000 paths (379us vs 217us -- the extra kernel launch's
+fixed dispatch overhead dominates at this size), roughly break-even at
+200,000, and modestly faster at 2,000,000 (5.00ms vs 5.59ms, ~11%) and
+10,000,000 paths (23.6ms vs 28.0ms, ~16%) as avoiding the full-array
+`copy_to_host()` starts to outweigh the second launch's fixed cost.
+Real, but a genuinely modest win at the sizes tested here -- reported
+honestly rather than oversold; see `benchmarks/monte_carlo_paths.py`.
 Risk: medium -- getting a correct, race-free parallel reduction in MSL
 right (threadgroup barriers, non-power-of-two sizes) is a real
-correctness hazard.
+correctness hazard; resolved by reusing already-proven primitives
+rather than inventing new lowering.
 Complexity: medium.
 
 **Shared/threadgroup memory** -- done. `metal.shared_array(shape,

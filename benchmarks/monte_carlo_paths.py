@@ -103,6 +103,36 @@ def _make_metal_kernel():
     return metal_kernel
 
 
+def _make_metal_payoff_kernel():
+    """Like `_make_metal_kernel`, but writes each path's call-option
+    payoff (`max(terminal - K, 0)`) directly, instead of the raw terminal
+    price -- so the entire "terminal value -> payoff" step that would
+    otherwise run on the CPU after `copy_to_host()` happens on the GPU,
+    leaving only a single scalar `metal.reduce_sum()` + a tiny host-side
+    mean/discount computation before the estimate is done. This is what
+    `metal.reduce_sum` (see numba_metal/reductions.py) is for: replacing
+    the current "download the whole per-path array, reduce on the CPU"
+    pattern documented as a boundary in this file's own module docstring
+    and in docs/roadmap.md's Phase 2 reductions entry.
+    """
+    from numba_metal import metal
+
+    @metal.jit
+    def metal_payoff_kernel(z, out, n_steps, s0, k, drift, diffusion):
+        p = metal.grid(1)
+        if p < out.size:
+            log_s = math.log(s0)
+            for step in range(n_steps):
+                log_s = log_s + drift + diffusion * z[p, step]
+            terminal = math.exp(log_s)
+            payoff = terminal - k
+            if payoff < 0.0:
+                payoff = 0.0
+            out[p] = payoff
+
+    return metal_payoff_kernel
+
+
 def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResult]:
     results = []
     metal_available = require_metal_or_skip()
@@ -228,13 +258,58 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
             gpu_ok, gpu_note = assert_allclose(
                 np.array([gpu_estimate]), np.array([bs_price]), rtol=0.05, atol=0.5
             )
-            result.correctness_ok = cpu_ok and gpu_ok
+
+            # GPU-reduced variant: the payoff kernel writes max(terminal-K,0)
+            # directly, and metal.reduce_sum() (numba_metal/reductions.py)
+            # sums it on the GPU -- only a 1-element buffer round-trips to
+            # the host, instead of the full n_paths-element array. Compares
+            # directly against `launch_and_reduce` above (identical work,
+            # different reduction strategy) for an honest, apples-to-apples
+            # before/after of this specific primitive.
+            payoff_kernel = _make_metal_payoff_kernel()
+            d_payoff = metal.device_array(n_paths, np.float32)
+
+            def payoff_launch():
+                payoff_kernel[blocks, threads](
+                    d_z,
+                    d_payoff,
+                    np.int32(n_steps),
+                    np.float32(S0),
+                    np.float32(K),
+                    drift,
+                    diffusion,
+                )
+
+            def launch_and_reduce_on_gpu():
+                payoff_launch()
+                total = metal.reduce_sum(d_payoff)
+                return float(np.exp(-R * T) * total.copy_to_host()[0] / n_paths)
+
+            launch_and_reduce_on_gpu()  # warm up / compile
+            t_e2e_gpu_reduced = time_repeated(
+                launch_and_reduce_on_gpu, warmup=2, repeats=5
+            )
+            result.extra["metal_gpu_reduced_end_to_end_ns"] = (
+                t_e2e_gpu_reduced.median_ns
+            )
+
+            gpu_reduced_estimate = launch_and_reduce_on_gpu()
+            gpu_reduced_ok, gpu_reduced_note = assert_allclose(
+                np.array([gpu_reduced_estimate]),
+                np.array([bs_price]),
+                rtol=0.05,
+                atol=0.5,
+            )
+
+            result.correctness_ok = cpu_ok and gpu_ok and gpu_reduced_ok
             result.correctness_note = (
                 f"BS analytic={bs_price:.4f} cpu={cpu_estimate:.4f} "
-                f"gpu={gpu_estimate:.4f} numpy={numpy_estimate:.4f}"
+                f"gpu={gpu_estimate:.4f} gpu_reduced={gpu_reduced_estimate:.4f} "
+                f"numpy={numpy_estimate:.4f}; gpu_reduced: {gpu_reduced_note}"
             )
             result.extra["black_scholes_price"] = bs_price
             result.extra["gpu_estimate"] = gpu_estimate
+            result.extra["gpu_reduced_estimate"] = gpu_reduced_estimate
         else:
             result.correctness_ok = cpu_ok
             result.correctness_note = (
@@ -246,6 +321,17 @@ def run(sizes: list[int] = SIZES, n_steps: int = N_STEPS) -> list[BenchmarkResul
 
 
 if __name__ == "__main__":
-    from common import print_table
+    from common import format_ns, print_table
 
-    print_table(run())
+    results = run()
+    print_table(results)
+    print()
+    for r in results:
+        e2e_cpu_reduced = r.metal_end_to_end_warm_ns
+        e2e_gpu_reduced = r.extra.get("metal_gpu_reduced_end_to_end_ns")
+        if e2e_gpu_reduced is not None and e2e_cpu_reduced:
+            print(
+                f"{r.benchmark} {r.size_label}: end-to-end with CPU-side "
+                f"reduction={format_ns(e2e_cpu_reduced)} vs. GPU-side "
+                f"reduction (metal.reduce_sum)={format_ns(e2e_gpu_reduced)}"
+            )
