@@ -57,12 +57,21 @@ architecture: an identical memory-access pattern is bandwidth-bound and
 regime (0.60×, i.e. a 40% slowdown relative to parallel CPU), and
 compute-bound and *improves* under the same scaling in another (13.66×
 speedup), with no change to the kernel's memory-access pattern at all. We
+extend this beyond a two-point demonstration with a controlled
+arithmetic-intensity sweep (§6.2) that empirically locates the real
+crossover point, finding it to be problem-size-dependent and, at the
+sizes tested, well below the theoretical ridge point obtained by simply
+dividing two independently measured throughput ceilings — ceilings that,
+we show, almost certainly originate from the project's own
+`numba-metal advisor` tool, a ~4,200-line CLI subpackage for scanning,
+profiling, and comparing candidate kernels that we give a full,
+evidence-scoped account of for the first time (§6.5). We
 also report, in full and without omission, a compiler bug that was found,
 partially fixed, verified against 500 randomized test cases and the full
 existing test suite, and then found — only once measured against a real,
 structurally different production kernel — to produce silently incorrect
 results on every one of 1,000 test elements, and was consequently reverted
-in its entirety rather than shipped with a caveat (§6.2). We argue this
+in its entirety rather than shipped with a caveat (§6.3). We argue this
 reversion, not any single benchmark number, is the paper's most important
 methodological result.
 
@@ -121,12 +130,22 @@ conditions?
    structured tree's shape, not merely a block's content), the verification
    protocol that initially passed (500 randomized trials plus the full
    pre-existing test suite), and the specific, more complex real-world
-   kernel shape that exposed the failure (§6.2). We present this not as an
+   kernel shape that exposed the failure (§6.3). We present this not as an
    embarrassment to be minimized but as the paper's central methodological
    argument: a fix that passes randomized testing and an existing test suite
    is not thereby proven correct, and shipping it without testing against a
    structurally different, real production kernel would have been a real,
    silent correctness regression.
+5. **An empirically measured roofline ridge point**, in place of a purely
+   theoretical one: a controlled arithmetic-intensity sweep (§6.2) that
+   holds a kernel's memory-access pattern and problem size fixed while
+   scaling arithmetic operations per point across a real, multi-point
+   range, showing the actual measured crossover is problem-size-dependent
+   and, at the sizes tested, sits well below the ~3.09 FLOPs/byte figure
+   obtained by simply dividing two independently measured throughput
+   ceilings — together with a proper account of the project's own
+   `numba-metal advisor` tool (§6.5), the CLI infrastructure those ceiling
+   figures and this paper's roofline classifications ultimately depend on.
 
 ## 2. Related work
 
@@ -190,7 +209,7 @@ control-flow tree itself before ever emitting a line of MSL text (§3). This
 is architecturally the more constrained and more fragile path of the two:
 LLVM IR is a mature, general-purpose compiler intermediate representation
 with decades of correctness tooling behind it, whereas this project's
-control-flow structurer is bespoke, project-specific code, and — as §6.2
+control-flow structurer is bespoke, project-specific code, and — as §6.3
 documents in detail — bespoke control-flow-reconstruction code is exactly
 where this project's one serious, reverted correctness bug originated.
 
@@ -323,7 +342,7 @@ Numba's own bytecode lowering actually produces for `if`, `for x in
 range(...)`, and a bounded subset of `while` are recognized; every other
 shape raises a specific, named compile-time error rather than emitting
 speculative or partially-correct MSL (§4.1 discusses this "no silent
-fallback" policy in more detail, and §6.2 documents a case where a
+fallback" policy in more detail, and §6.3 documents a case where a
 structuring-stage bug slipped past this policy's testing regime, despite the
 policy itself, and was caught only by testing against a real production
 kernel shape).
@@ -416,7 +435,7 @@ already proven correct for `for`-range loop bodies.
 
 `break` nested inside that `if`/`else` is supported, and the reasoning for
 why it required a real, non-trivial fix — not merely a testing gap — is
-detailed in §6.2. `continue` nested in the identical syntactic position is
+detailed in §6.3. `continue` nested in the identical syntactic position is
 *not* supported, and the reason is architecturally deeper than "not yet
 implemented": Numba's lowering routes a `continue` in this position through
 a *separate* guard block that re-tests the original loop condition (because
@@ -475,7 +494,7 @@ supports.
 | 8 | Implied volatility | Newton-Raphson solve for the volatility implied by an option's market price; a real-world example of the `while`+`if`/`else` shape in §4.3 |
 | 9 | Asian option pricing | Monte Carlo pricing of an average-price option, 500 timesteps per path with a running-average payoff accumulated every step |
 
-A tenth measurement, the device-function compile-time cache (§6.3), is
+A tenth measurement, the device-function compile-time cache (§6.4), is
 compiler infrastructure rather than a numerical workload and is reported
 separately.
 
@@ -589,7 +608,112 @@ this earlier finding, converted on both the CPU and GPU sides simultaneously
 from the outset, specifically to avoid repeating this exact category of
 mistake.
 
-### 6.2 A reverted compiler fix: when passing tests is not enough
+### 6.2 Locating the ridge point: a controlled arithmetic-intensity sweep
+
+Section 6.1's linear-vs-nonlinear comparison is a two-point demonstration:
+it shows *that* arithmetic intensity determines which side of the roofline
+a kernel falls on, using exactly two measured FLOPs/byte values. It does
+not, by itself, say *where* the crossover is, nor whether that crossover
+is a single fixed number or a function of problem size. Separately,
+`docs/performance-guidance.md` states a ridge point of **~3.09 FLOPs/byte**,
+derived by dividing two independently-measured single-point ceilings
+(~683 GFLOPS float32 compute-bound ceiling, divided by ~221 GB/s
+bandwidth-bound ceiling, divided by 4 bytes per float32). That number is a
+theoretical construction from two peak-throughput microbenchmarks, not a
+measurement of where any real, generated kernel actually crosses over —
+and prior to this section, no benchmark or test anywhere in this project
+varied arithmetic intensity across more than two discrete points to check
+whether the theoretical ridge point matches real kernel behavior.
+
+To close that gap, `benchmarks/arithmetic_intensity_sweep.py` holds the
+heat-diffusion stencil's memory-access pattern *and* problem size fixed
+within each run (4 float32 reads + 1 float32 write per point, 20
+bytes/point, identical to Section 6.1's kernels) and varies only a `REPS`
+parameter that repeats a data-dependent `math.exp`-based coefficient
+computation `REPS` times per neighbor before combining — a sequential
+dependency chain (each repeat consumes the previous repeat's output),
+deliberately structured so neither Numba's LLVM backend nor
+numba-metal's MSL lowering can hoist or eliminate the repeated work as
+loop-invariant. An initial version of this script used a
+loop-invariant computation instead and was silently optimized away by
+both compilers to identical wall-clock time at every `REPS` value — a
+real methodological trap, caught only by checking that the computed
+output actually changed with `REPS` before trusting any timing from it.
+An additional `REPS = -1` mode reproduces the *original*,
+pre-Perona-Malik linear-diffusion kernel exactly (`0.25 × sum of the 4
+raw neighbor values`, ~0.2 FLOPs/byte), giving a validated low-end
+anchor: this mode's measured speedups (0.79×, 0.94×, 1.05× at 128²,
+512², 1024², 200 iterations, GPU-resident buffers) reproduce Table 4's
+independently-measured linear-diffusion row (0.72×, 0.91×, 1.00×) to
+within normal run-to-run variance, confirming the sweep harness matches
+the rest of this paper's own measurement methodology rather than
+introducing a second, incompatible one. (One methodological detail
+mattered enough to be worth naming: `heat_diffusion.py`'s own
+`_metal_resident` helper rebuilds the `@metal.jit` kernel closure on
+every call rather than reusing one built outside the timed loop: doing
+so costs a real, repeatable ~2× wall-clock penalty at 1024² — 21ms vs.
+~11ms per 200-iteration run — evidently because numba-metal's
+`KernelCache` does not treat two structurally-identical closures built
+from separate Python function objects as the same cache entry. The
+sweep script deliberately matches this rebuild-per-call convention so
+its numbers stay comparable to Table 4, but this is itself a real,
+previously-undocumented cache-key characteristic worth flagging for
+anyone else timing numba-metal kernels this way.)
+
+**Table 4a: Empirically measured speedup vs. FLOPs/byte, by grid size**
+
+| FLOPs/byte | 128² | 512² | 1024² |
+|---:|---:|---:|---:|
+| 0.20 (linear floor) | 0.79× | 0.94× | 1.05× |
+| 0.65 | 0.51× | 0.75× | 1.02× |
+| 1.65 | 0.74× | 2.74× | 6.18× |
+| 2.65 | 0.87× | 3.46× | 6.33× |
+| 4.65 | 1.08× | 4.37× | 6.58× |
+| 8.65 | 1.64× | 5.24× | 7.20× |
+| **Interpolated parity crossover** | **~3.72** | **~0.73** | **between 0.65 and 1.65** |
+
+The headline finding is that the ridge point is not one number: it
+depends on problem size, and at the sizes actually exercised by this
+benchmark suite, the real crossover sits **well below** the theoretical
+3.09 FLOPs/byte figure for anything above a few hundred grid points per
+side. At 512² and 1024², parity is reached somewhere under 1 FLOP/byte —
+roughly a third to a tenth of the theoretically-derived ridge point — and
+by 1.65 FLOPs/byte (four `exp`-based coefficient evaluations per neighbor)
+Metal is already winning by 6×–6.3× at those sizes. Only at 128² does the
+empirical crossover (~3.72 FLOPs/byte) land close to the theoretical
+figure, and at that size dispatch-and-synchronization overhead is large
+enough relative to the total work that Metal never clearly wins across
+the measured range at all — consistent with this paper's Section 2.6
+discussion of per-launch overhead as the other lever besides bandwidth
+that a coarse ridge-point number does not capture.
+
+**What this means as practical guidance**, stated with the same
+directness as `docs/performance-guidance.md`'s existing rules of thumb:
+for a stencil-shaped kernel on this class of Apple Silicon GPU, treat
+"a handful of transcendental-function-equivalent operations per neighbor,
+at problem sizes of a few hundred points per side or larger" as
+comfortably inside the compute-bound regime — the practical floor is
+lower than the theoretical ridge point would suggest. Below roughly
+one FLOP per byte moved, and especially at small (≲128²) problem sizes,
+treat the kernel as bandwidth- or overhead-bound and expect parity or a
+Metal loss, matching Section 6.1's own linear-diffusion result. The gray
+zone between these — where the answer depends on both problem size and
+exact arithmetic intensity, and a single ridge-point number is not
+precise enough to predict it — is real and should be measured directly
+with `numba-metal advisor compare` (Section 6.5) rather than assumed
+from the theoretical figure alone.
+
+This sweep covers one kernel family (a 4-neighbor 2D stencil) at three
+problem sizes and one iteration count; it is not a claim that 0.73
+FLOPs/byte is *the* crossover for numba-metal in general, only that *a*
+real, measured crossover for this kernel family is well below the
+theoretically-derived figure, and that the theoretical figure alone
+should not be treated as a reliable predictor of real kernel behavior
+without checking it this way. Reproducing or extending this sweep to
+other kernel shapes (dense matrix-style access patterns, gather/scatter,
+reductions) is listed as future work in Section 7.
+
+### 6.3 A reverted compiler fix: when passing tests is not enough
 
 Section 4.3 describes the current, shipped boundary of `while`-loop support:
 `break` nested inside a rotated-while's own `if`/`else` is supported;
@@ -653,7 +777,7 @@ happen to cover. The bug here was not caught by writing more random tests
 in the same style; it was caught by testing against one specific, real
 production kernel whose actual shape had not been anticipated.
 
-### 6.3 A genuine compiler infrastructure improvement: device-function compile-time caching
+### 6.4 A genuine compiler infrastructure improvement: device-function compile-time caching
 
 Not every compiler-level investigation in this project concluded negatively.
 Motivated by an earlier finding that factoring a small, hot-loop
@@ -695,6 +819,68 @@ version of this same cache — prior to finding and fixing the two defects
 above — measured a **0.92× outcome (a net loss)** and was not shipped; only
 the corrected, independently reverified version is part of the project.
 
+### 6.5 The `numba-metal advisor` tool
+
+Every roofline claim in this paper and in `docs/performance-guidance.md`
+depends on being able to actually measure a candidate kernel's compute-vs-
+bandwidth classification and compare its CPU and Metal performance without
+hand-writing a bespoke benchmark script each time. `numba-metal` ships a
+dedicated tool for exactly this, in `src/numba_metal/advisor/` (roughly
+4,200 lines across 15 modules: static scanning, Numba/MSL compatibility
+dry-runs, a runtime profiler with instrumentation hooks, CPU-vs-Metal
+comparison and correctness verification, opportunity scoring, a
+deterministic recommendation engine, ASCII flame-graph/timeline
+rendering, an interactive terminal UI, and device calibration), installed
+as a real console-script entry point (`numba-metal`, declared in
+`pyproject.toml`'s `[project.scripts]`) with its own test suite under
+`tests/advisor/`. It is documented in full in `docs/advisor.md`; this
+section exists because, despite `docs/performance-guidance.md` citing it
+six times as the source of its own roofline classifications, an earlier
+draft of this paper mentioned it exactly once, in passing, without
+explaining what it is or that it is real, working infrastructure — an
+omission this section corrects.
+
+The tool exposes five subcommands: `scan` (static AST analysis of a
+codebase to find `@njit`/`@prange` candidates for Metal, without ever
+importing or executing the scanned code), `profile` (runtime profiling of
+a script or pytest run, producing an ASCII flame graph and CPU/GPU
+timeline from real instrumentation events), `compare` (CPU-vs-Metal
+timing and correctness comparison for a given script, the subcommand
+`docs/performance-guidance.md` cites directly for its `BANDWIDTH_BOUND`/
+`COMPUTE_BOUND` classifications), `report` (re-rendering a previously
+saved JSON profile), and `calibrate` (measuring this machine's own
+dispatch overhead, compile cost, memory bandwidth, and float32 throughput
+ceilings, cached to disk). `docs/performance-guidance.md`'s own cited
+figures — the ~683 GFLOPS and ~221 GB/s ceilings behind the 3.09
+theoretical ridge point discussed in Section 6.2 — are, based on matching
+units, order of magnitude, and the absence of any other committed
+benchmark script producing these exact numbers, almost certainly the
+output of a `numba-metal advisor calibrate` run, though this paper does
+not have a recorded calibration-run log confirming that provenance with
+certainty.
+
+In the course of preparing this paper, `scan` and `calibrate` were run
+directly against this repository and confirmed to produce real,
+non-fabricated output: `scan` correctly identified `@njit`/`@prange`
+candidates across `benchmarks/` without executing any of them, and
+`calibrate` produced a fresh set of device ceiling measurements in the
+same units and order of magnitude as those already cited in
+`docs/performance-guidance.md`. `compare` has a real implementation and a
+passing test suite under `tests/advisor/`, but was not independently
+re-run end-to-end against a live kernel in the course of preparing this
+specific paper revision; this distinction — direct confirmation for
+`scan` and `calibrate`, implementation-plus-passing-tests but not a fresh
+live run for `compare` — is stated explicitly here rather than
+smoothed into a single blanket claim that "the advisor works."
+
+The honest scope of this section is that the advisor is real, useful,
+substantially tested infrastructure that this paper's own quantitative
+claims already depend on indirectly, and that it deserved a real
+description rather than the single passing citation it received before
+this revision — not a claim that every one of its five subcommands has
+been independently re-verified against a live kernel in this paper's
+preparation.
+
 ## 7. Scope, limitations, and threats to validity
 
 This section is deliberately explicit about what this work does not
@@ -715,9 +901,9 @@ per measurement, following the project's own documented convention) affords.
 **No formal proof of the structurer's correctness.** The control-flow
 structurer (§3.2) is verified by a combination of unit tests, differential
 testing against a Python reference implementation, and — critically, per
-§6.2 — testing against specific real-world kernel shapes discovered to
+§6.3 — testing against specific real-world kernel shapes discovered to
 expose bugs the former two methods missed. It is not formally verified, and
-§6.2 is direct, first-party evidence that its current test suite, however
+§6.3 is direct, first-party evidence that its current test suite, however
 substantial (334 tests as of this writing), does not exhaust the space of
 CFG shapes Numba's bytecode lowering can produce. The `continue`-in-rotated-
 while limitation documented in §4.3 is a conservative response to this same
@@ -729,7 +915,7 @@ capability was left unimplemented and clearly documented as such.
 property test (`tests/differential/test_differential.py::test_quick_
 differential`) fails on a randomly generated kernel combining nested
 `if`/`else` and a `for`-range loop — a shape containing no `while` loop at
-all, and therefore independent of the §4.3/§6.2 discussion — with a
+all, and therefore independent of the §4.3/§6.3 discussion — with a
 compile-time `UnsupportedFeatureError` ("block reached more than once as a
 loop header"). This failure predates the work described in this paper, was
 confirmed (via `git stash` bisection) to be unrelated to any change made
@@ -832,6 +1018,9 @@ python benchmarks/cyclist_aerodynamics.py
 python benchmarks/implied_volatility.py
 python benchmarks/asian_option_pricing.py
 python benchmarks/device_function_compile_cache.py
+python benchmarks/arithmetic_intensity_sweep.py --grid 1024 --reps -1 0 1 2 4 8
+numba-metal advisor scan .
+numba-metal advisor calibrate
 ```
 
 The full test suite (334 tests as of this writing, one pre-existing and
